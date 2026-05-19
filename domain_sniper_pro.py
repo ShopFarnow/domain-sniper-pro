@@ -116,14 +116,36 @@ def fetch_expireddomains(limit=80):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
         resp = requests.get(url, headers=headers, timeout=30)
+        log.info(f"expireddomains.net HTTP {resp.status_code}, {len(resp.text)} bytes")
+        if resp.status_code != 200:
+            log.error(f"Non-200 response: {resp.status_code}")
+            return []
         soup = BeautifulSoup(resp.text, "html.parser")
-        table = soup.find("table", {"class": "base1"})
-        if not table: return []
+        # Try multiple possible table selectors
+        table = soup.find("table", {"class": "base1"}) or soup.find("table", {"class": "grid"}) or soup.find("table", {"id": "domains"})
+        if not table:
+            # Fallback: find any table with domain links
+            tables = soup.find_all("table")
+            log.info(f"Found {len(tables)} tables, trying first one")
+            if tables:
+                table = tables[0]
+            else:
+                log.warning("No table found on page")
+                # Save first 500 chars for debugging
+                log.debug(f"Page snippet: {resp.text[:500]}")
+                return []
+        rows = table.find_all("tr")
+        log.info(f"Found {len(rows)} rows in table")
         domains = []
-        for row in table.find_all("tr")[1:limit+1]:
+        for row in rows[1:limit+1]:
             cols = row.find_all("td")
             if len(cols) >= 2:
-                d = cols[1].get_text(strip=True).lower()
+                domain_cell = cols[1]
+                a = domain_cell.find("a")
+                if a:
+                    d = a.get_text(strip=True).lower()
+                else:
+                    d = domain_cell.get_text(strip=True).lower()
                 if d and "." in d:
                     domains.append((d, "expired"))
         log.info(f"expireddomains.net: {len(domains)} domains")
@@ -132,25 +154,32 @@ def fetch_expireddomains(limit=80):
         log.error(f"expireddomains.net error: {e}")
         traceback.print_exc()
         return []
-
 def fetch_dropcatch(limit=40):
     url = "https://www.dropcatch.com/domain/search?q=&tlds=.com&orderby=bids&order=desc"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
         resp = requests.get(url, headers=headers, timeout=30)
+        log.info(f"DropCatch HTTP {resp.status_code}, {len(resp.text)} bytes")
+        if resp.status_code != 200:
+            return []
         soup = BeautifulSoup(resp.text, "html.parser")
         domains = []
-        for tag in soup.find_all("td", {"class": "domain"})[:limit]:
-            d = tag.get_text(strip=True).lower()
-            if d and "." in d:
-                domains.append((d, "auction"))
+        # Try multiple selectors
+        selectors = ["td.domain", "a.domain-link", "div.domain-name"]
+        for sel in selectors:
+            elements = soup.select(sel)
+            if elements:
+                for el in elements[:limit]:
+                    d = el.get_text(strip=True).lower()
+                    if d and "." in d:
+                        domains.append((d, "auction"))
+                break
         log.info(f"dropcatch.com: {len(domains)} domains")
         return domains
     except Exception as e:
         log.error(f"dropcatch.com error: {e}")
         traceback.print_exc()
         return []
-
 def fetch_expireddomains_keyword(keyword, limit=20):
     url = f"https://www.expireddomains.net/domain-name-search/?q={keyword}&searchfilter=&o=ts&r=&status=available"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
