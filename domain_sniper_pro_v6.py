@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║         Domain Fortress Sniper PRO  v6 – Fixed & Production Ready           ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-FIXES applied over v6:
-  1. Replaced broken domainsdb.info with reliable Namebeta scraper
-  2. Added Reddit OAuth support (if credentials provided) – higher limits
-  3. Fixed Reddit public JSON fallback when OAuth unavailable
-  4. Added fallback sentiment when RSS feeds fail (uses mock)
-  5. Reduced default MAX_WORKERS from 6 → 3 to avoid 503 storms
-  6. Added proper user-agent rotation for all scrapers
-  7. Included vaderSentiment in import guard (graceful fallback)
-  8. Removed NewsAPI hard dependency (optional)
-  9. Added per‑source timeout & retry configuration
- 10. Ensured generated fallback domains are only used if primary sources return 0
+Domain Fortress Sniper PRO v6 – Fixed & Production Ready
+(Full script – copy exactly as shown)
 """
 
 import os, sys, re, time, json, sqlite3, logging, smtplib
@@ -82,7 +69,7 @@ GMAIL_APP_PASS    = os.getenv("GMAIL_APP_PASS", "")
 AFFILIATE_ID_GD   = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC   = os.getenv("AFFILIATE_ID_NC", "")
 DB_PATH           = os.getenv("DB_PATH", "domain_sniper_v6.db")
-MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "3"))   # reduced to avoid 503
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "3"))
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")
 REDDIT_CLIENT_ID  = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_SECRET     = os.getenv("REDDIT_SECRET", "")
@@ -151,7 +138,6 @@ HN_FEEDS = {
     "best": "https://hacker-news.firebaseio.com/v0/beststories.json",
 }
 
-# Subreddits for public JSON (fallback if OAuth not configured)
 REDDIT_SUBREDDITS = [
     "technology", "artificial", "MachineLearning", "startups",
     "entrepreneur", "investing", "personalfinance", "cybersecurity",
@@ -300,10 +286,9 @@ def fetch_namebeta(limit: int = 200) -> List[Tuple[str, str]]:
         return []
     soup = BeautifulSoup(resp.text, "html.parser")
     domains = []
-    # Namebeta table: rows with class "domain-row" or standard table
     rows = soup.select("table tbody tr, .domain-row")
     if not rows:
-        rows = soup.find_all("tr")[1:]  # fallback
+        rows = soup.find_all("tr")[1:]
     for row in rows[:limit]:
         cells = row.find_all("td")
         if len(cells) >= 2:
@@ -319,7 +304,6 @@ def fetch_namebeta(limit: int = 200) -> List[Tuple[str, str]]:
     return domains
 
 def fetch_expireddomains_rss() -> List[Tuple[str, str]]:
-    """Fallback – best-effort expireddomains.net scrape (often fails on GitHub)."""
     domains = []
     try:
         resp = http_get("https://www.expireddomains.net/deleted-domains/", timeout=15)
@@ -350,7 +334,6 @@ def fetch_namecheap_drops() -> List[Tuple[str, str]]:
     return domains
 
 def generate_fallback_domains(limit: int = 100) -> List[Tuple[str, str]]:
-    """Only used if all real sources return 0."""
     keywords = list(NICHE_MAP.keys())[:20]
     tlds = [".com", ".io", ".ai", ".co"]
     domains = []
@@ -421,7 +404,6 @@ class TrendRadar:
         return counts
 
     def _reddit_oauth_keywords(self, limit_per_sub: int = 25) -> Counter:
-        """Use Reddit OAuth for higher rate limits."""
         import requests.auth
         client_auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_SECRET)
         post_data = {"grant_type": "client_credentials"}
@@ -592,7 +574,6 @@ class SentimentEngine:
             headlines += f1.result()
             headlines += f2.result()
         if not headlines:
-            # Fallback neutral sentiment
             result = {"compound": 0.0, "positive": 0.0, "negative": 0.0,
                       "headline_count": 0, "top_headlines": "[]", "sentiment_score": 50}
             cache_sentiment(self.conn, keyword, result)
@@ -1000,12 +981,16 @@ def send_email_digest(results: List[Dict]):
     for d in top:
         sent_color = "#22c55e" if d["sentiment_compound"] > 0.1 else "#ef4444" if d["sentiment_compound"] < -0.1 else "#94a3b8"
         html_rows += f"""
-        <tr><td><b>{d['domain']}</b><br><small>{d['source']}</small></td>
-        <td align="center"><b>{d['final_score']}</b></td><td>{d['niche']}</td>
-        <td>{d['primary_path'].replace('_',' ').title()}</td>
-        <td align="center"><span style="color:{sent_color}">{d['sentiment_compound']:+.2f}</span><br><small>{d['velocity_label']}</small></td>
-        <td align="center">${d['est_monthly_usd']:.0f}/mo</td><td>{d['flip_range']}</td>
-        <td><a href="{d['link_sedo']}">Sedo</a> │ <a href="{d['link_dan']}">Dan</a></td></tr>"""
+        <tr>
+          <td><b>{d['domain']}</b><br><small>{d['source']}</small></td>
+          <td align="center"><b>{d['final_score']}</b></td>
+          <td>{d['niche']}</td>
+          <td>{d['primary_path'].replace('_',' ').title()}</td>
+          <td align="center"><span style="color:{sent_color}">{d['sentiment_compound']:+.2f}</span><br><small>{d['velocity_label']}</small></td>
+          <td align="center">${d['est_monthly_usd']:.0f}/mo</td>
+          <td>{d['flip_range']}</td>
+          <td><a href="{d['link_sedo']}">Sedo</a> │ <a href="{d['link_dan']}">Dan</a></td>
+        </tr>"""
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:780px;margin:auto;color:#1e293b">
     <h2 style="color:#6366f1">🏴‍☠️ Domain Sniper PRO v6 – Daily Intelligence Digest</h2>
@@ -1013,7 +998,7 @@ def send_email_digest(results: List[Dict]):
     <table border="1" cellpadding="6" style="border-collapse:collapse;width:100%;font-size:13px">
       <tr style="background:#1e1b4b;color:white"><th>Domain</th><th>Score</th><th>Niche</th><th>Best Path</th><th>Sentiment / Velocity</th><th>Monthly</th><th>Flip Range</th><th>Links</th></tr>
       {html_rows}
-    </table>
+     </table>
     <p style="font-size:10px;color:#94a3b8;margin-top:20px">Domain Sniper PRO v6 – automated estimates only. DYOR before purchasing.</p>
     </body></html>"""
     msg = MIMEMultipart("alternative")
@@ -1046,7 +1031,6 @@ def main():
     CC_INDEX_URL = get_cc_index()
     log.info(f"CommonCrawl index: {CC_INDEX_URL}")
 
-    # Trend radar
     radar = TrendRadar(conn)
     if CUSTOM_KEYWORDS:
         trending = [{"keyword": k, "combined_signal": 100, "trend_pct": 0, "velocity": 0,
@@ -1057,7 +1041,6 @@ def main():
         trending = radar.get_trending_keywords(top_n=30)
     log.info(f"Top 5 trending: {[k['keyword'] for k in trending[:5]]}")
 
-    # Domain discovery – primary reliable source
     all_domains = fetch_namebeta(limit=200)
     if not all_domains:
         log.warning("Namebeta returned 0, trying fallback sources...")
@@ -1086,7 +1069,6 @@ def main():
         conn.close()
         return
 
-    # Scoring
     sentiment_engine = SentimentEngine(conn)
     results = []
     args_list = [(d, src, conn, sentiment_engine) for d, src in unique]
