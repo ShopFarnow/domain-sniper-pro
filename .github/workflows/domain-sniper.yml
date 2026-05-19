@@ -2,8 +2,8 @@ name: Domain Sniper PRO (Zero Investment)
 
 on:
   schedule:
-    - cron: "30 2 * * *"      # 8:00 AM IST daily (2:30 UTC)
-  workflow_dispatch:           # manual trigger
+    - cron: "30 2 * * *"
+  workflow_dispatch:
 
 env:
   TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -29,18 +29,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Restore SQLite DB (persistence)
+      - name: Restore SQLite DB
         uses: actions/cache@v4
         with:
           path: domain_sniper.db
-          key: sniper-db-${{ github.run_id }}
-          restore-keys: sniper-db-
+          key: sniper-db-persistent
+          restore-keys: sniper-db-persistent
       - name: Upgrade pip & setuptools
-  run: pip install --upgrade pip setuptools wheel
-
-- name: Install dependencies
-  run: pip install -r requirements.txt
-  
+        run: pip install --upgrade pip setuptools wheel
+      - name: Install dependencies
+        run: pip install -r requirements.txt
       - name: Run Domain Sniper PRO
         run: python domain_sniper_pro.py
       - name: Upload CSV output
@@ -52,4 +50,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: domain_sniper.db
-          key: sniper-db-${{ github.run_id }}
+          key: sniper-db-persistent
