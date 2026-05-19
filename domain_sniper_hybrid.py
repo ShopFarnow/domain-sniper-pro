@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-Domain Fortress Sniper – Hybrid Edition
-Combines production‑grade reliability (stock screener pattern) with
-advanced intelligence (v7 probability, Kelly, SEO, combinatorics).
-
-All environment variables are documented below.
-Runs on GitHub Actions; uses SQLite cache + Google Sheets + Telegram.
+Domain Fortress Sniper – Hybrid Edition (with detailed progress tracking)
 """
 
 import os, sys, re, time, json, sqlite3, logging, smtplib
@@ -25,9 +20,7 @@ import feedparser
 from bs4 import BeautifulSoup
 import whois
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  IMPORTS WITH GRACEFUL FALLBACK
-# ─────────────────────────────────────────────────────────────────────────────
+# Optional imports
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
     VADER_OK = True
@@ -50,9 +43,7 @@ try:
 except ImportError:
     GSPREAD_OK = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LOGGING (stock screener style)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- LOGGING (with timestamps) ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
@@ -60,9 +51,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("DomainSniperHybrid")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENVIRONMENT VARIABLES (all from GitHub secrets)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- ENVIRONMENT (unchanged) ----------
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
@@ -78,17 +67,12 @@ AFFILIATE_ID_NC   = os.getenv("AFFILIATE_ID_NC", "")
 DB_PATH           = os.getenv("DB_PATH", "domain_sniper_hybrid.db")
 MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "4"))
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")
-NAMEBIO_KEY       = os.getenv("NAMEBIO_KEY", "")       # optional, never used yet
-WHOAPI_KEY        = os.getenv("WHOAPI_KEY", "")       # optional
-SCORE_FLOOR       = int(os.getenv("SCORE_FLOOR", "45"))
 KELLY_BANKROLL    = float(os.getenv("KELLY_BANKROLL", "10000"))
 ENABLE_TRADEMARK  = os.getenv("USPTO_SEARCH", "0") == "1"
 MAX_DOMAINS       = int(os.getenv("MAX_DOMAINS", "300"))
 CUSTOM_KEYWORDS   = [k.strip() for k in os.getenv("TREND_KEYWORDS", "").split(",") if k.strip()]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONSTANTS (same as v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- CONSTANTS (unchanged) ----------
 TLD_VALUE = {
     ".com":100, ".io":88, ".ai":92, ".co":75, ".net":60, ".org":55,
     ".in":45, ".us":42, ".app":74, ".dev":72, ".tech":58,
@@ -145,7 +129,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-# RSS and social feeds (free)
 NEWS_RSS_FEEDS = {
     "tech":    "https://feeds.feedburner.com/TechCrunch",
     "ai":      "https://www.artificialintelligence-news.com/feed/",
@@ -161,9 +144,7 @@ REDDIT_SUBS = [
     "entrepreneur","investing","personalfinance","SaaS",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  HTTP LAYER (with retry and backoff, stock screener style)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- HTTP LAYER with timeout and retry (unchanged) ----------
 def http_get(url: str, timeout: int = 20, retries: int = 3,
              backoff: float = 2.0, json_resp: bool = False,
              extra_headers: Optional[Dict] = None) -> Any:
@@ -193,9 +174,7 @@ def http_post(url: str, body: Dict, timeout: int = 15) -> Optional[requests.Resp
     except Exception:
         return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SQLITE WITH MUTEX (thread-safe)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- SQLITE (unchanged) ----------
 _DB_LOCK = threading.Lock()
 
 def init_db() -> sqlite3.Connection:
@@ -280,9 +259,7 @@ def put_cached(conn, table: str, key: str, data: Dict, ttl_hours: int = 6):
     db_write(conn, f"INSERT OR REPLACE INTO {table}(keyword,{','.join(cols)}) VALUES(?,{placeholders})",
              (key,) + tuple(vals))
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PROBABILITY ENGINE (v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- PROBABILITY ENGINE (unchanged) ----------
 class ProbabilityEngine:
     LOGISTIC_A = 0.08
     LOGISTIC_B = -4.5
@@ -347,9 +324,7 @@ class ProbabilityEngine:
         return {"f_star": f, "allocation_usd": alloc, "payoff_ratio": round(b,2),
                 "expected_value": ev, "verdict": verdict}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  COMBINATORICS ENGINE (v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- COMBINATORICS ENGINE (unchanged) ----------
 class CombinatoricsEngine:
     POWER_PREFIXES = {"get":1.3,"buy":1.5,"hire":1.4,"find":1.2,"top":1.3,
                       "best":1.35,"pro":1.2,"my":1.1,"fast":1.2,"smart":1.15}
@@ -394,6 +369,7 @@ class CombinatoricsEngine:
         return round(score, 3)
 
     def generate_candidates(self, keywords: List[Dict], top_n: int = 200) -> List[Tuple[str, str, float]]:
+        log.info("CombinatoricsEngine: generating candidate domains from trending keywords...")
         results = []
         seen = set()
         for kw_data in sorted(keywords, key=lambda x: x.get("combined_signal",0)+x.get("trend_pct",0)*0.3, reverse=True)[:25]:
@@ -414,11 +390,10 @@ class CombinatoricsEngine:
                                     if cps > 0:
                                         results.append((dom, f"combo:{kw}", cps))
         results.sort(key=lambda x: x[2], reverse=True)
+        log.info(f"CombinatoricsEngine: generated {len(results)} candidates")
         return results[:top_n]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SEO INTELLIGENCE (v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- SEO INTELLIGENCE (unchanged) ----------
 class SEOIntelligence:
     COMMERCIAL = {"buy","hire","get","find","service","agency","pro","company","firm","local"}
     INFORMATIONAL = {"how","what","why","guide","tips","best","top","review"}
@@ -497,9 +472,7 @@ class SEOIntelligence:
         put_cached(self.conn, "seo_cache", keyword, result, ttl_hours=12)
         return result
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TREND RADAR (v6/v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- TREND RADAR (unchanged, but we added progress logs) ----------
 class TrendRadar:
     STOP = {"the","and","for","this","that","with","from","are","has","was","not","but","its","you","can","will","new","how","why","all","one","what","have","they","some","more","use","get","out","via","top","over","been","were","just","now","your","who","our","may","into","than","says","said","also","about","their","would","could","year","time","first","make","like","other"}
     def __init__(self, conn): self.conn = conn
@@ -529,6 +502,7 @@ class TrendRadar:
         return 0.0,0.0
 
     def _hn_keywords(self) -> Counter:
+        log.info("TrendRadar: fetching HackerNews...")
         cnt = Counter()
         ids = http_get(HN_TOP, timeout=10, json_resp=True)
         if not ids: return cnt
@@ -541,6 +515,7 @@ class TrendRadar:
         return cnt
 
     def _reddit_keywords(self) -> Counter:
+        log.info("TrendRadar: fetching Reddit...")
         cnt = Counter()
         headers = {"User-Agent": "DomainSniperHybrid/1.0"}
         for sub in REDDIT_SUBS[:6]:
@@ -558,6 +533,7 @@ class TrendRadar:
         return cnt
 
     def _rss_keywords(self) -> Counter:
+        log.info("TrendRadar: fetching RSS feeds...")
         cnt = Counter()
         for _, url in NEWS_RSS_FEEDS.items():
             try:
@@ -570,17 +546,22 @@ class TrendRadar:
         return cnt
 
     def _crypto_trending(self) -> List[str]:
+        log.info("TrendRadar: fetching CoinGecko trending...")
         data = http_get("https://api.coingecko.com/api/v3/search/trending", timeout=10, json_resp=True)
         if not data: return []
         return [c["item"]["symbol"].lower() for c in data.get("coins",[])[:7]]
 
     def get_trending_keywords(self, top_n: int = 30) -> List[Dict]:
-        log.info("TrendRadar: scanning HN, Reddit, RSS, CoinGecko…")
+        log.info("TrendRadar: starting multi-source scan...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            hn  = ex.submit(self._hn_keywords).result()
-            rd  = ex.submit(self._reddit_keywords).result()
-            rss = ex.submit(self._rss_keywords).result()
-            crypto = ex.submit(self._crypto_trending).result()
+            hn_fut = ex.submit(self._hn_keywords)
+            reddit_fut = ex.submit(self._reddit_keywords)
+            rss_fut = ex.submit(self._rss_keywords)
+            crypto_fut = ex.submit(self._crypto_trending)
+            hn = hn_fut.result()
+            rd = reddit_fut.result()
+            rss = rss_fut.result()
+            crypto = crypto_fut.result()
         all_kws = {k for k in set(hn) | set(rd) | set(rss) if k not in self.STOP and len(k)>=4}
         combined = {}
         for kw in all_kws:
@@ -588,7 +569,7 @@ class TrendRadar:
             if kw in crypto: s += 10
             if s > 0: combined[kw] = s
         top = sorted(combined, key=combined.get, reverse=True)[:top_n]
-        log.info(f"TrendRadar: {len(top)} keywords")
+        log.info(f"TrendRadar: {len(top)} keywords extracted")
         results = []
         for kw in top:
             cached = get_cached(self.conn, "trend_cache", kw)
@@ -610,9 +591,7 @@ class TrendRadar:
                       r["combined_signal"], datetime.utcnow().isoformat()))
         return results
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SENTIMENT ENGINE (v6/v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- SENTIMENT ENGINE (unchanged) ----------
 class SentimentEngine:
     def __init__(self, conn):
         self.conn = conn
@@ -657,9 +636,7 @@ class SentimentEngine:
         put_cached(self.conn,"sentiment_cache",keyword,r,ttl_hours=4)
         return r
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  COMPARABLE SALES (v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- COMPARABLE SALES (unchanged) ----------
 class NameBioComps:
     def __init__(self, conn): self.conn = conn
     def fetch(self, keyword: str, niche: str) -> Dict:
@@ -691,9 +668,7 @@ class NameBioComps:
                 pass
         return prices
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TRADEMARK GUARD (v7)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- TRADEMARK GUARD (unchanged) ----------
 class TrademarkGuard:
     @staticmethod
     def check(domain: str) -> Dict:
@@ -707,17 +682,17 @@ class TrademarkGuard:
         if hits <= 3: return {"risk":"CAUTION","matches":hits,"detail":"Check manually"}
         return {"risk":"RISK","matches":hits,"detail":"Active TM found"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DOMAIN DISCOVERY (best effort free sources + combo fallback)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- DOMAIN DISCOVERY (with timeouts and logging) ----------
 def fetch_domainsdb(limit=200) -> List[Tuple[str,str]]:
+    log.info("Fetching DomainsDB...")
     data = http_get("https://api.domainsdb.info/v1/domains/search?domain=*.com&limit=200", timeout=20, json_resp=True)
     if not data: return []
     out = [(i.get("domain","").lower().strip(), "domainsdb") for i in data.get("domains",[])[:limit] if i.get("domain")]
-    log.info(f"DomainsDB: {len(out)}")
+    log.info(f"DomainsDB: {len(out)} domains")
     return out
 
 def fetch_expireddomains_page1() -> List[Tuple[str,str]]:
+    log.info("Fetching ExpiredDomains.net (page 1)...")
     domains = []
     try:
         resp = http_get("https://www.expireddomains.net/deleted-domains/?ftlds[]=com&fwhois=22", timeout=15)
@@ -727,10 +702,11 @@ def fetch_expireddomains_page1() -> List[Tuple[str,str]]:
                 d = a.text.strip().lower()
                 if d and "." in d: domains.append((d,"expireddomains"))
     except Exception as e: log.debug(f"ExpiredDomains: {e}")
-    log.info(f"ExpiredDomains: {len(domains)}")
+    log.info(f"ExpiredDomains: {len(domains)} domains")
     return domains
 
 def fetch_dropcatch_feed() -> List[Tuple[str,str]]:
+    log.info("Fetching DropCatch RSS feed...")
     domains = []
     try:
         p = feedparser.parse("https://www.dropcatch.com/rss/auctions")
@@ -738,19 +714,19 @@ def fetch_dropcatch_feed() -> List[Tuple[str,str]]:
             m = re.search(r"[a-z0-9\-]+\.[a-z]{2,}", getattr(e,"title","").lower())
             if m: domains.append((m.group(),"dropcatch"))
     except Exception as e: log.debug(f"DropCatch RSS: {e}")
-    log.info(f"DropCatch: {len(domains)}")
+    log.info(f"DropCatch: {len(domains)} domains")
     return domains
 
 def generate_fallback_domains(limit=100) -> List[Tuple[str,str]]:
+    log.info("Generating fallback domains (static keywords + TLDs)...")
     kws = list(NICHE_SCORE.keys())[:20]
     tlds = [".com",".io",".ai",".co"]
     out = [(f"{k}{t}","fallback") for k in kws for t in tlds] + [(f"{k}pro{t}","fallback") for k in kws for t in tlds]
     random.shuffle(out)
+    log.info(f"Fallback domains generated: {len(out[:limit])}")
     return out[:limit]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CLASSIC SCORING HELPERS (from v5/v6)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------- SCORING HELPERS (unchanged) ----------
 def get_cc_index() -> str:
     data = http_get("https://index.commoncrawl.org/collinfo.json", timeout=10, json_resp=True)
     if data: return data[0].get("cdx-api","https://index.commoncrawl.org/CC-MAIN-2024-10-index")
@@ -915,9 +891,6 @@ def build_affiliate_links(domain):
     links["afternic"] = f"https://www.afternic.com/domain/{domain}"
     return links
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DOMAIN PROCESSOR (full hybrid)
-# ─────────────────────────────────────────────────────────────────────────────
 _prob_engine = ProbabilityEngine()
 _combo_engine = CombinatoricsEngine()
 
@@ -1027,9 +1000,6 @@ def process_domain_safe(args):
     try: return process_domain(domain,src,conn,seo,sent,comps,tm)
     except Exception as e: log.error(f"Error {domain}: {e}"); return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  OUTPUT: HTML REPORT, GOOGLE SHEETS, TELEGRAM, EMAIL
-# ─────────────────────────────────────────────────────────────────────────────
 def generate_html_report(df: pd.DataFrame, run_id: str) -> str:
     top = df.head(20)
     rows = ""
@@ -1058,7 +1028,7 @@ def generate_html_report(df: pd.DataFrame, run_id: str) -> str:
     </style></head><body>
     <h1>🏴‍☠️ Domain Sniper Hybrid – Institutional Report</h1>
     <p><b>Run:</b> {run_id} | <b>Date:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | <b>Scored:</b> {len(df)}</p>
-    <table><tr><th>Domain</th><th>Score</th><th>Niche/Intent</th><th>Sentiment/Vel</th><th>P(Flip)</th><th>MC 95% CI</th><th>Kelly/$</th><th>Path</th><th>Links</th></tr>
+    <tr><tr><th>Domain</th><th>Score</th><th>Niche/Intent</th><th>Sentiment/Vel</th><th>P(Flip)</th><th>MC 95% CI</th><th>Kelly/$</th><th>Path</th><th>Links</th></tr>
     {rows}
     </table><p style="font-size:10px;color:#94a3b8">Not financial advice. DYOR.</p></body></html>"""
     path = f"report_hybrid_{run_id}.html"
@@ -1106,7 +1076,7 @@ def send_email_digest(results):
     rows = ""
     for d in top:
         kc = "#16a34a" if d["kelly_verdict"]=="Strong Buy" else "#ca8a04" if d["kelly_verdict"]=="Buy" else "#64748b"
-        rows += f"<tr><td><b>{d['domain']}</b><br><small>{d['source']}</small></td><td align='center'><b>{d['final_score']}</b></td><td>{d['niche']}</td><td>{d['p_flip_success']:.0%}</td><td>{d['mc_ci95']}</td><td><b style='color:{kc}'>{d['kelly_verdict']}</b><br>${d['kelly_alloc_usd']:,.0f}</td><td><a href='{d['link_sedo']}'>Sedo</a></td></tr>"
+        rows += f"<tr><td><b>{d['domain']}</b><br><small>{d['source']}</small></td><td align='center'><b>{d['final_score']}</b></td><td>{d['niche']}</td><td align='center'>{d['p_flip_success']:.0%}</td><td align='center'>{d['mc_ci95']}</td><td align='center'><b style='color:{kc}'>{d['kelly_verdict']}</b><br>${d['kelly_alloc_usd']:,.0f}</td><td align='center'><a href='{d['link_sedo']}'>Sedo</a></td></tr>"
     html = (f"<html><body><h2>Domain Sniper Hybrid – Daily Digest</h2><p>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | {len(results)} scored</p>"
             f"<table border='1' cellpadding='5'><tr><th>Domain</th><th>Score</th><th>Niche</th><th>P(Flip)</th><th>MC CI95</th><th>Kelly/$</th><th>Buy</th></tr>{rows}</table>"
             f"<p>Not advice. DYOR.</p></body></html>")
@@ -1122,14 +1092,11 @@ def send_email_digest(results):
         log.info("Email digest sent")
     except Exception as e: log.error(f"Email error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
     global CC_INDEX_URL
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     log.info("═"*70)
-    log.info("  Domain Fortress Sniper – Hybrid Edition")
+    log.info("  Domain Fortress Sniper – Hybrid Edition (with progress logs)")
     log.info("═"*70)
     log.info(f"Run: {run_id}")
     log.info(f"VADER: {'✓' if VADER_OK else '✗'}")
@@ -1144,13 +1111,11 @@ def main():
     CC_INDEX_URL = get_cc_index()
     log.info(f"CommonCrawl index: {CC_INDEX_URL}")
 
-    # Shared engines
     seo_engine = SEOIntelligence(conn)
     sent_engine = SentimentEngine(conn)
     comps_engine = NameBioComps(conn)
     tm_guard = TrademarkGuard()
 
-    # Trend radar
     radar = TrendRadar(conn)
     if CUSTOM_KEYWORDS:
         trending = [{"keyword":k,"combined_signal":100,"trend_pct":0,"velocity":0,
@@ -1161,19 +1126,21 @@ def main():
         trending = radar.get_trending_keywords(top_n=30)
     log.info(f"Top 5 trending: {[k['keyword'] for k in trending[:5]]}")
 
-    # Combinatorics candidates
-    log.info("Generating candidate domains from trends…")
+    # Combinatorics engine
+    log.info("Step: Generating combinatorics candidates...")
     combo_candidates = _combo_engine.generate_candidates(trending, top_n=150)
-    log.info(f"Combo candidates: {len(combo_candidates)}")
+    log.info(f"  {len(combo_candidates)} combo candidates generated")
 
-    # Domain discovery (best effort)
+    # Domain discovery
+    log.info("Step: Fetching domains from external sources...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        f_db  = ex.submit(fetch_domainsdb, 200)
+        f_db = ex.submit(fetch_domainsdb, 200)
         f_exp = ex.submit(fetch_expireddomains_page1)
-        f_dc  = ex.submit(fetch_dropcatch_feed)
+        f_dc = ex.submit(fetch_dropcatch_feed)
         all_domains = f_db.result() + f_exp.result() + f_dc.result()
     all_domains += [(d,s) for d,s,_ in combo_candidates]
     if not all_domains:
+        log.warning("No domains from any source – using fallback generator")
         all_domains = generate_fallback_domains(150)
 
     log.info(f"Total raw candidates: {len(all_domains)}")
@@ -1192,6 +1159,7 @@ def main():
         return
 
     # Parallel scoring
+    log.info(f"Step: Scoring {len(unique)} domains (MAX_WORKERS={MAX_WORKERS})...")
     results = []
     args = [(d,s,conn,seo_engine,sent_engine,comps_engine,tm_guard) for d,s in unique]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -1225,7 +1193,6 @@ def main():
     for _,row in pearls.iterrows(): send_telegram(row.to_dict()); time.sleep(1)
     send_email_digest(results)
 
-    # Stats
     best = df.iloc[0]
     db_write(conn,"INSERT OR REPLACE INTO run_stats VALUES(?,?,?,?,?,?,?)",
              (run_id, run_id[:15], datetime.utcnow().isoformat(), len(results), len(pearls), best["domain"], int(best["final_score"])))
