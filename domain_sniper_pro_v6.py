@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Domain Fortress Sniper PRO v6 – Fixed & Production Ready
-(Full script – copy exactly as shown)
+Domain Fortress Sniper – Hybrid Edition
+Combines production‑grade reliability (stock screener pattern) with
+advanced intelligence (v7 probability, Kelly, SEO, combinatorics).
+
+All environment variables are documented below.
+Runs on GitHub Actions; uses SQLite cache + Google Sheets + Telegram.
 """
 
 import os, sys, re, time, json, sqlite3, logging, smtplib
-import random, traceback, hashlib, math
+import random, traceback, math, threading
 import concurrent.futures
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -13,6 +17,7 @@ from email.mime.multipart import MIMEMultipart
 from collections import Counter
 from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import quote_plus
+from itertools import permutations
 
 import requests
 import pandas as pd
@@ -20,47 +25,49 @@ import feedparser
 from bs4 import BeautifulSoup
 import whois
 
-# Optional imports with graceful fallback
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMPORTS WITH GRACEFUL FALLBACK
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    VADER_AVAILABLE = True
+    VADER_OK = True
 except ImportError:
-    VADER_AVAILABLE = False
-    print("[WARN] vaderSentiment not installed. Run: pip install vaderSentiment")
-
+    VADER_OK = False
 try:
     from pytrends.request import TrendReq
-    PYTRENDS_AVAILABLE = True
+    PYTRENDS_OK = True
 except ImportError:
-    PYTRENDS_AVAILABLE = False
-
+    PYTRENDS_OK = False
 try:
     import numpy as np
-    NUMPY_AVAILABLE = True
+    NUMPY_OK = True
 except ImportError:
-    NUMPY_AVAILABLE = False
-
+    NUMPY_OK = False
 try:
     import gspread
     from google.oauth2.service_account import Credentials
-    GSPREAD_AVAILABLE = True
+    GSPREAD_OK = True
 except ImportError:
-    GSPREAD_AVAILABLE = False
+    GSPREAD_OK = False
 
-# ========== LOGGING ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOGGING (stock screener style)
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-log = logging.getLogger("DomainSniperV6")
+log = logging.getLogger("DomainSniperHybrid")
 
-# ========== ENVIRONMENT ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENVIRONMENT VARIABLES (all from GitHub secrets)
+# ─────────────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "")
-SHEET_NAME        = os.getenv("SHEET_NAME", "DomainSniperV6")
+SHEET_NAME        = os.getenv("SHEET_NAME", "DomainSniperHybrid")
 MIN_ALERT_SCORE   = int(os.getenv("MIN_ALERT_SCORE", "68"))
 SAFE_BROWSING_KEY = os.getenv("SAFE_BROWSING_KEY", "")
 EMAIL_DIGEST_TO   = os.getenv("EMAIL_DIGEST_TO", "")
@@ -68,118 +75,115 @@ GMAIL_USER        = os.getenv("GMAIL_USER", "")
 GMAIL_APP_PASS    = os.getenv("GMAIL_APP_PASS", "")
 AFFILIATE_ID_GD   = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC   = os.getenv("AFFILIATE_ID_NC", "")
-DB_PATH           = os.getenv("DB_PATH", "domain_sniper_v6.db")
-MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "3"))
+DB_PATH           = os.getenv("DB_PATH", "domain_sniper_hybrid.db")
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "4"))
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")
-REDDIT_CLIENT_ID  = os.getenv("REDDIT_CLIENT_ID", "")
-REDDIT_SECRET     = os.getenv("REDDIT_SECRET", "")
-COINGECKO_KEY     = os.getenv("COINGECKO_API_KEY", "")
+NAMEBIO_KEY       = os.getenv("NAMEBIO_KEY", "")       # optional, never used yet
+WHOAPI_KEY        = os.getenv("WHOAPI_KEY", "")       # optional
 SCORE_FLOOR       = int(os.getenv("SCORE_FLOOR", "45"))
-MAX_TREND_SOURCES = int(os.getenv("MAX_TREND_SOURCES", "4"))
+KELLY_BANKROLL    = float(os.getenv("KELLY_BANKROLL", "10000"))
+ENABLE_TRADEMARK  = os.getenv("USPTO_SEARCH", "0") == "1"
+MAX_DOMAINS       = int(os.getenv("MAX_DOMAINS", "300"))
 CUSTOM_KEYWORDS   = [k.strip() for k in os.getenv("TREND_KEYWORDS", "").split(",") if k.strip()]
 
-# ========== CONSTANTS ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONSTANTS (same as v7)
+# ─────────────────────────────────────────────────────────────────────────────
 TLD_VALUE = {
-    ".com": 100, ".io": 88, ".ai": 92, ".co": 75, ".net": 60,
-    ".org": 55,  ".in": 45, ".us": 42, ".app": 74, ".dev": 72,
-    ".tech": 58, ".online": 30, ".info": 25, ".biz": 20,
-    ".xyz": 28, ".gg": 65, ".vc": 68, ".finance": 62,
+    ".com":100, ".io":88, ".ai":92, ".co":75, ".net":60, ".org":55,
+    ".in":45, ".us":42, ".app":74, ".dev":72, ".tech":58,
+    ".online":30, ".info":25, ".biz":20, ".xyz":28, ".gg":65,
+    ".vc":68, ".finance":62,
 }
 DEFAULT_TLD = 15
 
 NICHE_MAP = {
-    "insurance": 90, "loan": 90, "mortgage": 88, "crypto": 82, "ai": 88,
-    "saas": 82, "health": 76, "lawyer": 85, "travel": 65, "shop": 56,
-    "realestate": 80, "clinic": 78, "dentist": 80, "plumber": 72,
-    "solar": 76, "fintech": 84, "ecommerce": 72, "agency": 62,
-    "marketing": 66, "consulting": 70, "fitness": 66, "yoga": 60,
-    "vpn": 80, "hosting": 74, "invest": 86, "forex": 82, "nft": 68,
-    "defi": 78, "llm": 85, "gpt": 84, "blockchain": 78, "robotics": 75,
-    "ev": 74, "electric": 70, "sustainability": 68, "climate": 66,
-    "mental": 72, "therapy": 74, "telehealth": 78, "biotech": 76,
-    "quantum": 80, "drone": 70, "space": 72, "gaming": 68, "metaverse": 60,
+    "insurance":{"score":90,"cpc":54.91}, "loan":{"score":90,"cpc":44.28},
+    "mortgage":{"score":88,"cpc":47.12},  "crypto":{"score":82,"cpc":9.80},
+    "ai":{"score":88,"cpc":8.50},         "saas":{"score":82,"cpc":11.20},
+    "health":{"score":76,"cpc":6.10},     "lawyer":{"score":85,"cpc":54.86},
+    "realestate":{"score":80,"cpc":27.14},"clinic":{"score":78,"cpc":16.40},
+    "dentist":{"score":80,"cpc":31.90},   "plumber":{"score":72,"cpc":22.50},
+    "solar":{"score":76,"cpc":12.40},     "fintech":{"score":84,"cpc":13.20},
+    "ecommerce":{"score":72,"cpc":7.80},  "vpn":{"score":80,"cpc":6.90},
+    "hosting":{"score":74,"cpc":8.60},    "invest":{"score":86,"cpc":36.40},
+    "forex":{"score":82,"cpc":21.00},     "nft":{"score":68,"cpc":4.20},
+    "defi":{"score":78,"cpc":8.90},       "llm":{"score":85,"cpc":9.00},
+    "gpt":{"score":84,"cpc":7.50},        "blockchain":{"score":78,"cpc":5.60},
+    "robotics":{"score":75,"cpc":3.20},   "ev":{"score":74,"cpc":4.10},
+    "therapy":{"score":74,"cpc":18.90},   "telehealth":{"score":78,"cpc":12.30},
+    "biotech":{"score":76,"cpc":7.80},    "quantum":{"score":80,"cpc":4.50},
+    "gaming":{"score":68,"cpc":2.90},     "travel":{"score":65,"cpc":1.80},
+    "shop":{"score":56,"cpc":1.20},       "general":{"score":30,"cpc":0.50},
 }
+NICHE_SCORE = {k: v["score"] for k, v in NICHE_MAP.items()}
+NICHE_CPC   = {k: v["cpc"]   for k, v in NICHE_MAP.items()}
 
 PARKING_CPM = {
-    "insurance": 18, "loan": 15, "mortgage": 14, "crypto": 13, "ai": 12,
-    "saas": 10, "health": 9, "lawyer": 14, "travel": 8, "shop": 5,
-    "realestate": 11, "clinic": 10, "dentist": 12, "plumber": 9,
-    "solar": 10, "fintech": 13, "llm": 11, "ev": 9, "quantum": 10,
-    "general": 3,
+    "insurance":18,"loan":15,"mortgage":14,"crypto":13,"ai":12,
+    "saas":10,"health":9,"lawyer":14,"travel":8,"shop":5,
+    "realestate":11,"clinic":10,"dentist":12,"plumber":9,
+    "solar":10,"fintech":13,"llm":11,"ev":9,"general":3,
+}
+LEAD_VALUE = {
+    "insurance":28,"loan":22,"mortgage":32,"lawyer":45,
+    "dentist":18,"clinic":14,"plumber":10,"solar":20,
+    "realestate":22,"telehealth":16,"therapy":14,
 }
 
-LEAD_VALUE = {
-    "insurance": 28, "loan": 22, "mortgage": 32, "lawyer": 45,
-    "dentist": 18, "clinic": 14, "plumber": 10, "solar": 20,
-    "realestate": 22, "telehealth": 16, "therapy": 14,
+FLIP_MULTIPLES = {
+    "insurance":{"mean":4.2,"std":1.8},  "lawyer":{"mean":5.1,"std":2.1},
+    "ai":{"mean":6.8,"std":3.2},         "llm":{"mean":7.5,"std":3.8},
+    "fintech":{"mean":4.8,"std":2.0},    "saas":{"mean":5.5,"std":2.5},
+    "crypto":{"mean":3.9,"std":2.4},     "health":{"mean":3.7,"std":1.6},
+    "realestate":{"mean":4.0,"std":1.9}, "general":{"mean":2.5,"std":1.2},
 }
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-# RSS feeds (free, no key)
+# RSS and social feeds (free)
 NEWS_RSS_FEEDS = {
-    "tech":     "https://feeds.feedburner.com/TechCrunch",
-    "ai":       "https://www.artificialintelligence-news.com/feed/",
-    "crypto":   "https://cointelegraph.com/rss",
-    "business": "https://feeds.reuters.com/reuters/businessNews",
-    "health":   "https://medlineplus.gov/xml/mplus_topics_health_news.xml",
-    "startup":  "https://techcrunch.com/startups/feed/",
-    "finance":  "https://www.marketwatch.com/rss/realtimeheadlines",
-    "science":  "https://rss.sciencedaily.com/all.xml",
+    "tech":    "https://feeds.feedburner.com/TechCrunch",
+    "ai":      "https://www.artificialintelligence-news.com/feed/",
+    "crypto":  "https://cointelegraph.com/rss",
+    "business":"https://feeds.reuters.com/reuters/businessNews",
+    "startup": "https://techcrunch.com/startups/feed/",
+    "finance": "https://www.marketwatch.com/rss/realtimeheadlines",
+    "science": "https://rss.sciencedaily.com/all.xml",
 }
-
-HN_FEEDS = {
-    "top":  "https://hacker-news.firebaseio.com/v0/topstories.json",
-    "new":  "https://hacker-news.firebaseio.com/v0/newstories.json",
-    "best": "https://hacker-news.firebaseio.com/v0/beststories.json",
-}
-
-REDDIT_SUBREDDITS = [
-    "technology", "artificial", "MachineLearning", "startups",
-    "entrepreneur", "investing", "personalfinance", "cybersecurity",
-    "webdev", "Futurology", "business", "SaaS",
+HN_TOP = "https://hacker-news.firebaseio.com/v0/topstories.json"
+REDDIT_SUBS = [
+    "technology","artificial","MachineLearning","startups",
+    "entrepreneur","investing","personalfinance","SaaS",
 ]
 
-# ========== HELPER FUNCTIONS ==========
-def get_composite_weights(age: int, niche: str) -> Dict[str, float]:
-    if age == 0:
-        return {"foundation": 0.18, "flip": 0.28, "history": 0.14,
-                "sentiment": 0.22, "momentum": 0.12, "monetization": 0.06}
-    elif age < 3:
-        return {"foundation": 0.20, "flip": 0.26, "history": 0.16,
-                "sentiment": 0.18, "momentum": 0.12, "monetization": 0.08}
-    elif age < 10:
-        return {"foundation": 0.26, "flip": 0.26, "history": 0.18,
-                "sentiment": 0.14, "momentum": 0.10, "monetization": 0.06}
-    else:
-        return {"foundation": 0.30, "flip": 0.24, "history": 0.22,
-                "sentiment": 0.10, "momentum": 0.08, "monetization": 0.06}
-
-def http_get(url: str, timeout: int = 25, retries: int = 3,
-             backoff: float = 2.0, headers: Optional[Dict] = None,
-             json_resp: bool = False) -> Any:
-    _headers = {"User-Agent": random.choice(USER_AGENTS)}
-    if headers:
-        _headers.update(headers)
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTTP LAYER (with retry and backoff, stock screener style)
+# ─────────────────────────────────────────────────────────────────────────────
+def http_get(url: str, timeout: int = 20, retries: int = 3,
+             backoff: float = 2.0, json_resp: bool = False,
+             extra_headers: Optional[Dict] = None) -> Any:
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    if extra_headers:
+        headers.update(extra_headers)
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=_headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json() if json_resp else resp
-            if resp.status_code in (429, 503):
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return r.json() if json_resp else r
+            if r.status_code in (429, 503):
                 wait = backoff * (2 ** attempt) + random.uniform(0, 1)
-                log.warning(f"Rate-limited {resp.status_code} – waiting {wait:.1f}s")
+                log.warning(f"Rate-limited {r.status_code} – waiting {wait:.1f}s")
                 time.sleep(wait)
-            elif resp.status_code == 404:
-                return None
             else:
                 return None
         except Exception:
-            time.sleep(backoff * (attempt + 1))
+            pass
+        time.sleep(backoff * (attempt + 1))
     return None
 
 def http_post(url: str, body: Dict, timeout: int = 15) -> Optional[requests.Response]:
@@ -189,937 +193,1053 @@ def http_post(url: str, body: Dict, timeout: int = 15) -> Optional[requests.Resp
     except Exception:
         return None
 
-# ========== DATABASE ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  SQLITE WITH MUTEX (thread-safe)
+# ─────────────────────────────────────────────────────────────────────────────
+_DB_LOCK = threading.Lock()
+
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS seen_domains (
-        domain TEXT PRIMARY KEY, first_seen TEXT,
-        final_score INTEGER, monetization_path TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS blacklist (
-        domain TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS trend_cache (
-        keyword TEXT PRIMARY KEY, trend_pct REAL, velocity REAL,
-        source_count INTEGER, fetched_at TEXT, expires_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS sentiment_cache (
-        keyword TEXT PRIMARY KEY, compound REAL, positive REAL, negative REAL,
-        headline_count INTEGER, top_headlines TEXT, fetched_at TEXT, expires_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS keyword_signals (
-        keyword TEXT PRIMARY KEY, hn_mentions INTEGER, reddit_score INTEGER,
-        news_volume INTEGER, coingecko_rank INTEGER, combined_signal REAL,
-        updated_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS run_stats (
-        run_id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
-        domains_scanned INTEGER, pearls_found INTEGER,
-        top_domain TEXT, top_score INTEGER
-    )""")
+    tables = [
+        """CREATE TABLE IF NOT EXISTS seen_domains (
+            domain TEXT PRIMARY KEY, first_seen TEXT,
+            final_score INTEGER, monetization_path TEXT)""",
+        """CREATE TABLE IF NOT EXISTS blacklist (
+            domain TEXT PRIMARY KEY, reason TEXT, ts TEXT)""",
+        """CREATE TABLE IF NOT EXISTS trend_cache (
+            keyword TEXT PRIMARY KEY, trend_pct REAL, velocity REAL,
+            source_count INTEGER, fetched_at TEXT, expires_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS sentiment_cache (
+            keyword TEXT PRIMARY KEY, compound REAL, positive REAL,
+            negative REAL, headline_count INTEGER, top_headlines TEXT,
+            fetched_at TEXT, expires_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS keyword_signals (
+            keyword TEXT PRIMARY KEY, hn_mentions INTEGER,
+            reddit_score INTEGER, news_volume INTEGER,
+            coingecko_rank INTEGER, combined_signal REAL, updated_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS comps_cache (
+            keyword TEXT PRIMARY KEY, sales_json TEXT,
+            median_sale REAL, fetched_at TEXT, expires_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS run_stats (
+            run_id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
+            domains_scanned INTEGER, pearls_found INTEGER,
+            top_domain TEXT, top_score INTEGER)""",
+        """CREATE TABLE IF NOT EXISTS seo_cache (
+            keyword TEXT PRIMARY KEY, cpc REAL, search_vol_proxy REAL,
+            serp_competition REAL, intent_class TEXT,
+            seo_score REAL, fetched_at TEXT, expires_at TEXT)""",
+    ]
+    for ddl in tables:
+        c.execute(ddl)
     conn.commit()
     return conn
 
-def is_seen(conn, domain: str) -> bool:
-    return conn.execute("SELECT 1 FROM seen_domains WHERE domain=?", (domain,)).fetchone() is not None
+def db_write(conn, sql: str, params: tuple):
+    with _DB_LOCK:
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB write error: {e}")
 
-def mark_seen(conn, domain: str, score: int, path: str):
-    conn.execute("INSERT OR REPLACE INTO seen_domains VALUES (?,?,?,?)",
-                 (domain, datetime.utcnow().isoformat(), score, path))
-    conn.commit()
+def is_seen(conn, d: str) -> bool:
+    return conn.execute("SELECT 1 FROM seen_domains WHERE domain=?", (d,)).fetchone() is not None
 
-def is_blacklisted(conn, domain: str) -> bool:
-    return conn.execute("SELECT 1 FROM blacklist WHERE domain=?", (domain,)).fetchone() is not None
+def is_blacklisted(conn, d: str) -> bool:
+    return conn.execute("SELECT 1 FROM blacklist WHERE domain=?", (d,)).fetchone() is not None
 
-def add_to_blacklist(conn, domain: str, reason: str):
-    conn.execute("INSERT OR IGNORE INTO blacklist VALUES (?,?,?)",
-                 (domain, reason, datetime.utcnow().isoformat()))
-    conn.commit()
-    log.info(f"Blacklisted {domain}: {reason}")
+def mark_seen(conn, d: str, score: int, path: str):
+    db_write(conn, "INSERT OR REPLACE INTO seen_domains VALUES(?,?,?,?)",
+             (d, datetime.utcnow().isoformat(), score, path))
 
-def get_cached_trend(conn, keyword: str) -> Optional[Dict]:
-    row = conn.execute(
-        "SELECT trend_pct, velocity, source_count, expires_at FROM trend_cache WHERE keyword=?",
-        (keyword,)
-    ).fetchone()
-    if row and row[3] > datetime.utcnow().isoformat():
-        return {"trend_pct": row[0], "velocity": row[1], "source_count": row[2]}
+def add_blacklist(conn, d: str, reason: str):
+    db_write(conn, "INSERT OR IGNORE INTO blacklist VALUES(?,?,?)",
+             (d, reason, datetime.utcnow().isoformat()))
+
+def get_cached(conn, table: str, key: str) -> Optional[Dict]:
+    col_map = {
+        "trend_cache": ("trend_pct","velocity","source_count","expires_at"),
+        "sentiment_cache": ("compound","positive","negative","headline_count","top_headlines","expires_at"),
+        "comps_cache": ("sales_json","median_sale","expires_at"),
+        "seo_cache": ("cpc","search_vol_proxy","serp_competition","intent_class","seo_score","expires_at"),
+    }
+    cols = col_map.get(table)
+    if not cols:
+        return None
+    row = conn.execute(f"SELECT {','.join(cols)} FROM {table} WHERE keyword=?", (key,)).fetchone()
+    if row and row[-1] > datetime.utcnow().isoformat():
+        return dict(zip(cols[:-1], row[:-1]))
     return None
 
-def cache_trend(conn, keyword: str, trend_pct: float, velocity: float, source_count: int):
-    expires = (datetime.utcnow() + timedelta(hours=6)).isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO trend_cache VALUES (?,?,?,?,?,?)",
-        (keyword, trend_pct, velocity, source_count, datetime.utcnow().isoformat(), expires)
-    )
-    conn.commit()
+def put_cached(conn, table: str, key: str, data: Dict, ttl_hours: int = 6):
+    expires = (datetime.utcnow() + timedelta(hours=ttl_hours)).isoformat()
+    cols = list(data.keys()) + ["fetched_at", "expires_at"]
+    vals = list(data.values()) + [datetime.utcnow().isoformat(), expires]
+    placeholders = ",".join(["?"] * len(vals))
+    db_write(conn, f"INSERT OR REPLACE INTO {table}(keyword,{','.join(cols)}) VALUES(?,{placeholders})",
+             (key,) + tuple(vals))
 
-def get_cached_sentiment(conn, keyword: str) -> Optional[Dict]:
-    row = conn.execute(
-        "SELECT compound, positive, negative, headline_count, top_headlines, expires_at "
-        "FROM sentiment_cache WHERE keyword=?", (keyword,)
-    ).fetchone()
-    if row and row[5] > datetime.utcnow().isoformat():
-        return {"compound": row[0], "positive": row[1], "negative": row[2],
-                "headline_count": row[3], "top_headlines": row[4]}
-    return None
+# ─────────────────────────────────────────────────────────────────────────────
+#  PROBABILITY ENGINE (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class ProbabilityEngine:
+    LOGISTIC_A = 0.08
+    LOGISTIC_B = -4.5
+    NICHE_VOL = {"ai":0.65,"llm":0.72,"crypto":0.85,"fintech":0.58,
+                 "insurance":0.42,"lawyer":0.45,"general":0.60}
 
-def cache_sentiment(conn, keyword: str, data: Dict):
-    expires = (datetime.utcnow() + timedelta(hours=4)).isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO sentiment_cache VALUES (?,?,?,?,?,?,?,?)",
-        (keyword, data["compound"], data["positive"], data["negative"],
-         data["headline_count"], data.get("top_headlines", ""),
-         datetime.utcnow().isoformat(), expires)
-    )
-    conn.commit()
+    @staticmethod
+    def sigmoid(x): return 1.0 / (1.0 + math.exp(-x))
 
-# ========== RELIABLE DOMAIN SOURCE (Namebeta) ==========
-def fetch_namebeta(limit: int = 200) -> List[Tuple[str, str]]:
-    """Scrape Namebeta.com – returns real expiring domains with backlinks (no login)."""
-    url = "https://namebeta.com/expiring"
-    headers = {"User-Agent": random.choice(USER_AGENTS), "Referer": "https://namebeta.com/"}
-    resp = http_get(url, timeout=25, headers=headers)
-    if not resp:
-        log.warning("Namebeta request failed")
-        return []
-    soup = BeautifulSoup(resp.text, "html.parser")
-    domains = []
-    rows = soup.select("table tbody tr, .domain-row")
-    if not rows:
-        rows = soup.find_all("tr")[1:]
-    for row in rows[:limit]:
-        cells = row.find_all("td")
-        if len(cells) >= 2:
-            domain_cell = cells[0]
-            a = domain_cell.find("a")
-            if a:
-                d = a.get_text(strip=True).lower()
-            else:
-                d = domain_cell.get_text(strip=True).lower()
-            if d and "." in d and len(d) < 50:
-                domains.append((d, "namebeta"))
-    log.info(f"Namebeta: {len(domains)} domains")
-    return domains
+    def p_flip_success(self, final_score: int, niche: str, age: int, backlinks: int) -> float:
+        z = (self.LOGISTIC_A * final_score + self.LOGISTIC_B
+             + 0.05 * min(age, 15) + 0.003 * min(backlinks, 200))
+        base_p = self.sigmoid(z)
+        boost = {"ai":0.06,"llm":0.07,"fintech":0.04,"insurance":0.05,"lawyer":0.05}.get(niche,0.0)
+        return round(min(0.95, max(0.02, base_p + boost)), 4)
 
-def fetch_expireddomains_rss() -> List[Tuple[str, str]]:
-    domains = []
-    try:
-        resp = http_get("https://www.expireddomains.net/deleted-domains/", timeout=15)
-        if resp:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for a in soup.select("table.base1 td a")[:100]:
-                d = a.text.strip().lower()
-                if d and "." in d:
-                    domains.append((d, "expireddomains"))
-    except Exception as e:
-        log.debug(f"ExpiredDomains scrape error: {e}")
-    log.info(f"ExpiredDomains fallback: {len(domains)} domains")
-    return domains
+    def monte_carlo_flip_value(self, base_estimate: float, niche: str,
+                               n_sims: int = 10000) -> Dict:
+        if base_estimate <= 0:
+            return {"mean":0,"p10":0,"p50":0,"p90":0,"p95":0,"std":0,"ci95":"$0–$0"}
+        sigma = self.NICHE_VOL.get(niche, 0.60)
+        mu = math.log(base_estimate) - 0.5 * sigma**2
+        if NUMPY_OK:
+            samples = np.random.lognormal(mean=mu, sigma=sigma, size=n_sims)
+            p10, p50, p90, p95 = np.percentile(samples, [10,50,90,95])
+            mean, std = np.mean(samples), np.std(samples)
+        else:
+            # Box-Müller fallback
+            samples = []
+            for _ in range(n_sims):
+                u1,u2 = random.random(), random.random()
+                z0 = math.sqrt(-2*math.log(u1))*math.cos(2*math.pi*u2)
+                samples.append(math.exp(mu + sigma * z0))
+            samples.sort()
+            p10 = samples[int(0.10*n_sims)]
+            p50 = samples[int(0.50*n_sims)]
+            p90 = samples[int(0.90*n_sims)]
+            p95 = samples[int(0.95*n_sims)]
+            mean = sum(samples)/n_sims
+            std = math.sqrt(sum((s-mean)**2 for s in samples)/n_sims)
+        return {
+            "mean": round(mean,0), "p10": round(p10,0), "p50": round(p50,0),
+            "p90": round(p90,0), "p95": round(p95,0), "std": round(std,0),
+            "ci95": f"${p10:,.0f}–${p95:,.0f}",
+        }
 
-def fetch_namecheap_drops() -> List[Tuple[str, str]]:
-    domains = []
-    try:
-        resp = http_get("https://www.namecheap.com/domains/marketplace/drop-catching/", timeout=15)
-        if resp:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for el in soup.select("[data-domain], .domain-name")[:80]:
-                d = (el.get("data-domain") or el.text).strip().lower()
-                if d and "." in d:
-                    domains.append((d, "namecheap_drop"))
-    except Exception as e:
-        log.debug(f"Namecheap drops error: {e}")
-    log.info(f"Namecheap drops: {len(domains)} domains")
-    return domains
+    def kelly_fraction(self, p_win: float, b: float) -> float:
+        if b <= 0 or p_win <= 0: return 0.0
+        f = (b * p_win - (1-p_win)) / b
+        return round(max(0.0, min(0.25, f)), 4)
 
-def generate_fallback_domains(limit: int = 100) -> List[Tuple[str, str]]:
-    keywords = list(NICHE_MAP.keys())[:20]
-    tlds = [".com", ".io", ".ai", ".co"]
-    domains = []
-    for kw in keywords:
-        for tld in tlds:
-            domains.append((f"{kw}{tld}", "fallback"))
-            domains.append((f"{kw}pro{tld}", "fallback"))
-    random.shuffle(domains)
-    log.warning(f"Using fallback keyword generator ({len(domains[:limit])} domains)")
-    return domains[:limit]
+    def kelly_allocation(self, p_win: float, base_estimate: float,
+                         cost: float = 10.0) -> Dict:
+        if cost <= 0 or base_estimate <= cost:
+            return {"f_star":0.0,"allocation_usd":0.0,"payoff_ratio":0.0,
+                    "expected_value":0.0,"verdict":"Skip"}
+        b = (base_estimate - cost) / cost
+        f = self.kelly_fraction(p_win, b)
+        alloc = round(f * KELLY_BANKROLL, 2)
+        ev = round(p_win * (base_estimate - cost) - (1-p_win) * cost, 2)
+        verdict = "Strong Buy" if f > 0.10 else "Buy" if f > 0.04 else "Small" if f > 0.01 else "Pass"
+        return {"f_star": f, "allocation_usd": alloc, "payoff_ratio": round(b,2),
+                "expected_value": ev, "verdict": verdict}
 
-# ========== TREND RADAR ==========
-class TrendRadar:
-    def __init__(self, conn: sqlite3.Connection):
+# ─────────────────────────────────────────────────────────────────────────────
+#  COMBINATORICS ENGINE (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class CombinatoricsEngine:
+    POWER_PREFIXES = {"get":1.3,"buy":1.5,"hire":1.4,"find":1.2,"top":1.3,
+                      "best":1.35,"pro":1.2,"my":1.1,"fast":1.2,"smart":1.15}
+    POWER_SUFFIXES = {"pro":1.3,"hub":1.2,"ai":1.5,"io":1.2,"lab":1.15,"hq":1.1,
+                      "app":1.2,"ly":1.05,"base":1.1,"now":1.2,"fast":1.2,"easy":1.15}
+    NICHE_TLDS = {"crypto":[".io",".finance",".com"], "ai":[".ai",".io",".com"],
+                  "fintech":[".finance",".io",".com"], "saas":[".io",".app",".com"],
+                  "health":[".com",".io"], "default":[".com",".io",".co"]}
+
+    def _niche_tlds(self, niche: str) -> List[str]:
+        for k in self.NICHE_TLDS:
+            if k in niche:
+                return self.NICHE_TLDS[k]
+        return self.NICHE_TLDS["default"]
+
+    def score_combination(self, parts: List[str], tld: str) -> float:
+        sld = "".join(parts)
+        if len(sld) < 3 or len(sld) > 20: return 0.0
+        niche_kw = None
+        niche_s = NICHE_SCORE.get("general",30)
+        cpc_val = NICHE_CPC.get("general",0.5)
+        for p in parts:
+            if p in NICHE_SCORE:
+                niche_kw = p
+                niche_s = NICHE_SCORE[p]
+                cpc_val = NICHE_CPC.get(p,0.5)
+                break
+        if niche_kw is None: return 0.0
+        prefix_mult = 1.0
+        suffix_mult = 1.0
+        for p in parts:
+            if p != niche_kw:
+                if p in self.POWER_PREFIXES: prefix_mult = max(prefix_mult, self.POWER_PREFIXES[p])
+                if p in self.POWER_SUFFIXES: suffix_mult = max(suffix_mult, self.POWER_SUFFIXES[p])
+        tld_v = TLD_VALUE.get(tld, DEFAULT_TLD)
+        tld_mult = tld_v / 100.0
+        n = len(sld)
+        length_factor = max(0.3, 1.0 - max(0, n-8) * 0.05)
+        vowels = sum(1 for c in sld if c in "aeiou")
+        pronounce = 1.1 if 0.25 <= vowels/max(1,n) <= 0.5 else 1.0
+        score = (niche_s * 0.40 + cpc_val * 0.40 + tld_v * 0.20) * prefix_mult * suffix_mult * tld_mult * length_factor * pronounce
+        return round(score, 3)
+
+    def generate_candidates(self, keywords: List[Dict], top_n: int = 200) -> List[Tuple[str, str, float]]:
+        results = []
+        seen = set()
+        for kw_data in sorted(keywords, key=lambda x: x.get("combined_signal",0)+x.get("trend_pct",0)*0.3, reverse=True)[:25]:
+            kw = kw_data["keyword"].lower().strip()
+            if len(kw) < 3 or len(kw) > 16: continue
+            niche = next((n for n in self.NICHE_TLDS if n in kw), "default")
+            tlds = self._niche_tlds(niche)
+            for pref in self.POWER_PREFIXES:
+                for suf in self.POWER_SUFFIXES:
+                    for tld in tlds:
+                        for parts in [[pref,kw,suf], [pref,kw], [kw,suf], [kw]]:
+                            sld = "".join(parts)
+                            if 4 <= len(sld) <= 18:
+                                dom = f"{sld}{tld}"
+                                if dom not in seen:
+                                    seen.add(dom)
+                                    cps = self.score_combination(parts, tld)
+                                    if cps > 0:
+                                        results.append((dom, f"combo:{kw}", cps))
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:top_n]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SEO INTELLIGENCE (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class SEOIntelligence:
+    COMMERCIAL = {"buy","hire","get","find","service","agency","pro","company","firm","local"}
+    INFORMATIONAL = {"how","what","why","guide","tips","best","top","review"}
+
+    def __init__(self, conn):
         self.conn = conn
-        self._use_reddit_oauth = bool(REDDIT_CLIENT_ID and REDDIT_SECRET)
 
-    def _google_trend(self, keyword: str) -> Tuple[float, float]:
-        if not PYTRENDS_AVAILABLE:
-            return 0.0, 0.0
-        kw = re.sub(r"\.[a-z]{2,}$", "", keyword).replace("-", " ").strip()
-        if len(kw) < 2:
-            return 0.0, 0.0
+    def _search_vol_proxy(self, keyword: str) -> float:
+        cached = get_cached(self.conn, "trend_cache", keyword)
+        if cached:
+            return min(100, max(0, 50 + cached.get("trend_pct",0)*0.5))
+        return 50.0
+
+    def _serp_competition(self, cc_hits: int, backlinks: int) -> float:
+        comp = min(100, cc_hits * 5 + backlinks * 0.5)
+        return round(100 - comp, 1)
+
+    def _commercial_intent(self, domain: str) -> Tuple[float, str]:
+        sld = domain.split(".")[0].lower()
+        tokens = re.findall(r"[a-z]{3,}", sld)
+        comm = sum(1 for t in tokens if t in self.COMMERCIAL)
+        info = sum(1 for t in tokens if t in self.INFORMATIONAL)
+        niche_match = any(t in NICHE_SCORE for t in tokens)
+        if comm >= 2 or (comm >=1 and niche_match): return 90.0, "transactional"
+        if comm >=1: return 72.0, "commercial"
+        if info >=1 and niche_match: return 55.0, "informational"
+        if niche_match: return 50.0, "commercial"
+        return 30.0, "navigational"
+
+    def _eeat_proxy(self, age: int, backlinks: int, tld: str) -> float:
+        tld_trust = {".com":1.0,".org":1.0,".gov":1.2,".edu":1.2,".io":0.85,".ai":0.88}.get(tld,0.6)
+        age_score = min(100, age * 8)
+        link_score = min(100, backlinks * 2)
+        return round((age_score * 0.4 + link_score * 0.4 + tld_trust * 20), 1)
+
+    def _topical_authority(self, domain: str, niche: str) -> float:
+        sld = domain.split(".")[0].lower()
+        if niche != "general" and niche in sld:
+            extra = len(re.findall(r"[a-z]{3,}", sld)) - 1
+            return max(60, 100 - extra * 10)
+        return 45.0 if niche != "general" else 25.0
+
+    def _featured_snippet_opp(self, domain: str, cc_hits: int, intent: str) -> float:
+        if intent == "informational" and cc_hits < 3: return 80.0
+        if intent in ("commercial","transactional") and cc_hits < 5: return 60.0
+        return 30.0
+
+    def analyze(self, domain: str, niche: str, age: int, backlinks: int, cc_hits: int, tld: str) -> Dict:
+        keyword = domain.split(".")[0].lower()
+        cached = get_cached(self.conn, "seo_cache", keyword)
+        if cached:
+            return cached
+        vol = self._search_vol_proxy(keyword)
+        serp = self._serp_competition(cc_hits, backlinks)
+        intent_s, ic = self._commercial_intent(domain)
+        eeat = self._eeat_proxy(age, backlinks, tld)
+        topical = self._topical_authority(domain, niche)
+        fs = self._featured_snippet_opp(domain, cc_hits, ic)
+        cpc = NICHE_CPC.get(niche, NICHE_CPC.get("general",0.5))
+        cpc_score = min(100, cpc * 1.8)
+        seo_score = round(
+            cpc_score   * 0.22 +
+            intent_s    * 0.20 +
+            vol         * 0.16 +
+            eeat        * 0.16 +
+            topical     * 0.12 +
+            serp        * 0.08 +
+            fs          * 0.06, 1)
+        result = {
+            "cpc": round(cpc,2), "search_vol_proxy": round(vol,1),
+            "serp_competition": round(serp,1), "intent_class": ic,
+            "seo_score": seo_score, "cpc_score": round(cpc_score,1),
+            "intent_score": round(intent_s,1), "eeat_score": round(eeat,1),
+            "topical_score": round(topical,1), "fs_opportunity": round(fs,1),
+        }
+        put_cached(self.conn, "seo_cache", keyword, result, ttl_hours=12)
+        return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TREND RADAR (v6/v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class TrendRadar:
+    STOP = {"the","and","for","this","that","with","from","are","has","was","not","but","its","you","can","will","new","how","why","all","one","what","have","they","some","more","use","get","out","via","top","over","been","were","just","now","your","who","our","may","into","than","says","said","also","about","their","would","could","year","time","first","make","like","other"}
+    def __init__(self, conn): self.conn = conn
+
+    def _google_trend(self, kw: str) -> Tuple[float, float]:
+        if not PYTRENDS_OK: return 0.0,0.0
+        kw = re.sub(r"\.[a-z]{2,}$","",kw).replace("-"," ").strip()
+        if len(kw)<2: return 0.0,0.0
         for attempt in range(3):
             try:
-                pt = TrendReq(hl="en-US", tz=330, timeout=(10, 25), retries=2, backoff_factor=0.5)
+                pt = TrendReq(hl="en-US", tz=330, timeout=(10,25), retries=2, backoff_factor=0.5)
                 pt.build_payload([kw], timeframe="today 6-m")
                 df = pt.interest_over_time()
-                if df.empty or kw not in df.columns:
-                    return 0.0, 0.0
-                series = df[kw].values.astype(float)
-                n = len(series)
-                if n < 4:
-                    return 0.0, 0.0
-                half = n // 2
-                recent = series[-half:].mean()
-                older = series[:half].mean()
-                trend_pct = 0.0 if older == 0 else round((recent - older) / older * 100, 1)
-                if NUMPY_AVAILABLE and n >= 8:
-                    x = np.arange(min(8, n), dtype=float)
-                    y = series[-min(8, n):]
-                    slope = float(np.polyfit(x, y, 1)[0])
-                    velocity = round(slope / max(1, series.mean()) * 100, 2)
-                else:
-                    velocity = 0.0
-                return trend_pct, velocity
-            except Exception as e:
-                if "429" in str(e):
-                    time.sleep(4 ** attempt + random.uniform(1, 3))
-                else:
-                    break
-        return 0.0, 0.0
+                if df.empty or kw not in df.columns: return 0.0,0.0
+                s = df[kw].values.astype(float)
+                half = len(s)//2
+                old = s[:half].mean()
+                new = s[-half:].mean()
+                pct = 0.0 if old==0 else round((new-old)/old*100,1)
+                vel = 0.0
+                if NUMPY_OK and len(s)>=8:
+                    x = np.arange(8,dtype=float)
+                    vel = round(float(np.polyfit(x,s[-8:],1)[0]) / max(1,s.mean())*100,2)
+                return pct, vel
+            except Exception:
+                time.sleep(2**attempt + random.uniform(0,1))
+        return 0.0,0.0
 
-    def _hn_keywords(self, limit: int = 50) -> Counter:
-        counts = Counter()
-        stories = http_get(HN_FEEDS["top"], timeout=10, json_resp=True)
-        if not stories:
-            return counts
-        for sid in stories[:limit]:
-            item = http_get(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json",
-                            timeout=8, json_resp=True)
-            if not item:
-                continue
-            title = item.get("title", "").lower()
-            for word in re.findall(r"\b[a-z]{3,}\b", title):
-                counts[word] += 1
+    def _hn_keywords(self) -> Counter:
+        cnt = Counter()
+        ids = http_get(HN_TOP, timeout=10, json_resp=True)
+        if not ids: return cnt
+        for sid in ids[:50]:
+            item = http_get(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json", timeout=8, json_resp=True)
+            if item:
+                title = item.get("title","").lower()
+                for w in re.findall(r"\b[a-z]{3,}\b", title): cnt[w] += 1
             time.sleep(0.05)
-        return counts
+        return cnt
 
-    def _reddit_oauth_keywords(self, limit_per_sub: int = 25) -> Counter:
-        import requests.auth
-        client_auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_SECRET)
-        post_data = {"grant_type": "client_credentials"}
-        headers = {"User-Agent": "DomainSniperV6/1.0"}
-        try:
-            resp = requests.post("https://www.reddit.com/api/v1/access_token",
-                                 auth=client_auth, data=post_data, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                log.debug("Reddit OAuth failed – falling back to public JSON")
-                return self._reddit_public_keywords(limit_per_sub)
-            token = resp.json().get("access_token")
-            if not token:
-                return self._reddit_public_keywords(limit_per_sub)
-            headers["Authorization"] = f"bearer {token}"
-            counts = Counter()
-            for sub in REDDIT_SUBREDDITS[:6]:
-                url = f"https://oauth.reddit.com/r/{sub}/hot.json?limit={limit_per_sub}"
-                resp2 = requests.get(url, headers=headers, timeout=12)
-                if resp2.status_code != 200:
-                    continue
-                data = resp2.json()
-                for post in data.get("data", {}).get("children", []):
-                    title = post.get("data", {}).get("title", "").lower()
-                    score = post.get("data", {}).get("score", 1)
-                    for word in re.findall(r"\b[a-z]{3,}\b", title):
-                        counts[word] += max(1, int(math.log10(max(1, score))))
-                time.sleep(0.5)
-            return counts
-        except Exception as e:
-            log.debug(f"Reddit OAuth error: {e}")
-            return self._reddit_public_keywords(limit_per_sub)
-
-    def _reddit_public_keywords(self, limit_per_sub: int = 25) -> Counter:
-        counts = Counter()
-        headers = {"User-Agent": "DomainSniperV6/1.0"}
-        for sub in REDDIT_SUBREDDITS[:6]:
-            url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit_per_sub}"
+    def _reddit_keywords(self) -> Counter:
+        cnt = Counter()
+        headers = {"User-Agent": "DomainSniperHybrid/1.0"}
+        for sub in REDDIT_SUBS[:6]:
             try:
-                resp = requests.get(url, headers=headers, timeout=12)
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                for post in data.get("data", {}).get("children", []):
-                    title = post.get("data", {}).get("title", "").lower()
-                    score = post.get("data", {}).get("score", 1)
-                    for word in re.findall(r"\b[a-z]{3,}\b", title):
-                        counts[word] += max(1, int(math.log10(max(1, score))))
+                r = requests.get(f"https://www.reddit.com/r/{sub}/hot.json?limit=25", headers=headers, timeout=12)
+                if r.status_code != 200: continue
+                for post in r.json().get("data",{}).get("children",[]):
+                    title = post.get("data",{}).get("title","").lower()
+                    score = max(1, post.get("data",{}).get("score",1))
+                    w = max(1, int(math.log10(score)))
+                    for word in re.findall(r"\b[a-z]{3,}\b", title): cnt[word] += w
                 time.sleep(0.5)
             except Exception:
                 pass
-        return counts
+        return cnt
 
     def _rss_keywords(self) -> Counter:
-        counts = Counter()
-        for _, feed_url in NEWS_RSS_FEEDS.items():
+        cnt = Counter()
+        for _, url in NEWS_RSS_FEEDS.items():
             try:
-                parsed = feedparser.parse(feed_url)
-                for entry in parsed.entries[:20]:
-                    title = getattr(entry, "title", "").lower()
-                    for word in re.findall(r"\b[a-z]{4,}\b", title):
-                        counts[word] += 1
+                parsed = feedparser.parse(url)
+                for e in parsed.entries[:20]:
+                    title = getattr(e,"title","").lower()
+                    for w in re.findall(r"\b[a-z]{4,}\b", title): cnt[w] += 1
             except Exception:
-                continue
-        return counts
+                pass
+        return cnt
 
-    def _coingecko_trending(self) -> List[str]:
+    def _crypto_trending(self) -> List[str]:
         data = http_get("https://api.coingecko.com/api/v3/search/trending", timeout=10, json_resp=True)
-        if not data:
-            return []
-        return [coin["item"]["symbol"].lower() for coin in data.get("coins", [])[:7]]
-
-    STOP_WORDS = {"the","and","for","this","that","with","from","are","has","was","not","but","its","you","can","will","new","how","why","all","one","what","have","they","some","more","use","get","out","via","top","over","been","were","just","now","your","who","our","may","into","than","says","said","also","about","their","would","could","year","time","first","make","like","other"}
+        if not data: return []
+        return [c["item"]["symbol"].lower() for c in data.get("coins",[])[:7]]
 
     def get_trending_keywords(self, top_n: int = 30) -> List[Dict]:
-        log.info("TrendRadar: fetching multi‑source signals…")
+        log.info("TrendRadar: scanning HN, Reddit, RSS, CoinGecko…")
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            f_hn = ex.submit(self._hn_keywords)
-            if self._use_reddit_oauth:
-                f_reddit = ex.submit(self._reddit_oauth_keywords)
-            else:
-                f_reddit = ex.submit(self._reddit_public_keywords)
-            f_rss = ex.submit(self._rss_keywords)
-            f_crypto = ex.submit(self._coingecko_trending)
-            hn_counts = f_hn.result()
-            reddit_counts = f_reddit.result()
-            rss_counts = f_rss.result()
-            crypto_kws = f_crypto.result()
-        all_kws = set(hn_counts) | set(reddit_counts) | set(rss_counts)
-        all_kws = {k for k in all_kws if k not in self.STOP_WORDS and len(k) >= 4}
+            hn  = ex.submit(self._hn_keywords).result()
+            rd  = ex.submit(self._reddit_keywords).result()
+            rss = ex.submit(self._rss_keywords).result()
+            crypto = ex.submit(self._crypto_trending).result()
+        all_kws = {k for k in set(hn) | set(rd) | set(rss) if k not in self.STOP and len(k)>=4}
         combined = {}
         for kw in all_kws:
-            score = hn_counts.get(kw, 0) * 3.0 + reddit_counts.get(kw, 0) * 2.0 + rss_counts.get(kw, 0) * 1.5
-            if kw in crypto_kws:
-                score += 10
-            if score > 0:
-                combined[kw] = score
+            s = hn.get(kw,0)*3.0 + rd.get(kw,0)*2.0 + rss.get(kw,0)*1.5
+            if kw in crypto: s += 10
+            if s > 0: combined[kw] = s
         top = sorted(combined, key=combined.get, reverse=True)[:top_n]
         log.info(f"TrendRadar: {len(top)} keywords")
         results = []
         for kw in top:
-            cached = get_cached_trend(self.conn, kw)
+            cached = get_cached(self.conn, "trend_cache", kw)
             if cached:
-                trend_pct, vel = cached["trend_pct"], cached["velocity"]
+                tp, vel = cached["trend_pct"], cached["velocity"]
             else:
-                trend_pct, vel = self._google_trend(kw)
-                cache_trend(self.conn, kw, trend_pct, vel, 3)
-                time.sleep(random.uniform(0.3, 0.8))
-            results.append({
-                "keyword": kw,
-                "combined_signal": combined[kw],
-                "trend_pct": trend_pct,
-                "velocity": vel,
-                "in_hn": kw in hn_counts,
-                "in_reddit": kw in reddit_counts,
-                "in_rss": kw in rss_counts,
-                "in_crypto": kw in crypto_kws,
-            })
+                tp, vel = self._google_trend(kw)
+                put_cached(self.conn,"trend_cache",kw,{"trend_pct":tp,"velocity":vel,"source_count":3})
+                time.sleep(random.uniform(0.3,0.8))
+            results.append({"keyword":kw,"combined_signal":combined[kw],
+                            "trend_pct":tp,"velocity":vel,
+                            "in_hn":kw in hn,"in_reddit":kw in rd,
+                            "in_rss":kw in rss,"in_crypto":kw in crypto})
         for r in results:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO keyword_signals VALUES (?,?,?,?,?,?,?)",
-                (r["keyword"], int(r["in_hn"]), int(r["combined_signal"]),
-                 int(r["in_rss"]), int(r["in_crypto"]),
-                 r["combined_signal"], datetime.utcnow().isoformat())
-            )
-        self.conn.commit()
+            db_write(self.conn,
+                     "INSERT OR REPLACE INTO keyword_signals VALUES(?,?,?,?,?,?,?)",
+                     (r["keyword"], int(r["in_hn"]), int(r["combined_signal"]),
+                      int(r["in_rss"]), int(r["in_crypto"]),
+                      r["combined_signal"], datetime.utcnow().isoformat()))
         return results
 
-# ========== SENTIMENT ENGINE ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  SENTIMENT ENGINE (v6/v7)
+# ─────────────────────────────────────────────────────────────────────────────
 class SentimentEngine:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn):
         self.conn = conn
-        self.analyzer = SentimentIntensityAnalyzer() if VADER_AVAILABLE else None
+        self.vader = SentimentIntensityAnalyzer() if VADER_OK else None
 
-    def _score_text(self, text: str) -> Dict:
-        if not self.analyzer:
-            return {"compound": 0, "pos": 0, "neg": 0, "neu": 1}
-        return self.analyzer.polarity_scores(text)
+    def _score(self, text):
+        if not self.vader: return {"compound":0,"pos":0,"neg":0}
+        return self.vader.polarity_scores(text)
 
-    def _fetch_google_news_rss(self, keyword: str) -> List[str]:
-        url = f"https://news.google.com/rss/search?q={quote_plus(keyword)}&hl=en-US&gl=US"
-        headlines = []
+    def _gnews(self, kw):
         try:
-            parsed = feedparser.parse(url)
-            for entry in parsed.entries[:15]:
-                headlines.append(getattr(entry, "title", ""))
+            p = feedparser.parse(f"https://news.google.com/rss/search?q={quote_plus(kw)}&hl=en-US&gl=US")
+            return [getattr(e,"title","") for e in p.entries[:15]]
         except Exception:
-            pass
-        return headlines
+            return []
 
-    def _fetch_newsapi(self, keyword: str) -> List[str]:
-        if not NEWS_API_KEY:
-            return []
-        url = f"https://newsapi.org/v2/everything?q={quote_plus(keyword)}&sortBy=publishedAt&pageSize=10&language=en&apiKey={NEWS_API_KEY}"
-        data = http_get(url, timeout=10, json_resp=True)
-        if not data:
-            return []
-        return [a.get("title", "") for a in data.get("articles", [])[:10]]
+    def _newsapi(self, kw):
+        if not NEWS_API_KEY: return []
+        data = http_get(f"https://newsapi.org/v2/everything?q={quote_plus(kw)}&sortBy=publishedAt&pageSize=10&language=en&apiKey={NEWS_API_KEY}",
+                        timeout=10, json_resp=True)
+        return [a.get("title","") for a in (data or {}).get("articles",[])[:10]]
 
     def analyze(self, keyword: str) -> Dict:
-        cached = get_cached_sentiment(self.conn, keyword)
+        cached = get_cached(self.conn, "sentiment_cache", keyword)
         if cached:
-            cached["sentiment_score"] = 50 + cached["compound"] * 50
+            cached["sentiment_score"] = round(50 + cached["compound"]*50,1)
             return cached
-        headlines = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f1 = ex.submit(self._fetch_google_news_rss, keyword)
-            f2 = ex.submit(self._fetch_newsapi, keyword)
-            headlines += f1.result()
-            headlines += f2.result()
+            headlines = ex.submit(self._gnews, keyword).result() + ex.submit(self._newsapi, keyword).result()
         if not headlines:
-            result = {"compound": 0.0, "positive": 0.0, "negative": 0.0,
-                      "headline_count": 0, "top_headlines": "[]", "sentiment_score": 50}
-            cache_sentiment(self.conn, keyword, result)
-            return result
-        scores = [self._score_text(h) for h in headlines]
-        compound_avg = sum(s["compound"] for s in scores) / len(scores)
-        pos_avg = sum(s["pos"] for s in scores) / len(scores)
-        neg_avg = sum(s["neg"] for s in scores) / len(scores)
-        sorted_hl = sorted(zip(headlines, scores), key=lambda x: abs(x[1]["compound"]), reverse=True)
-        top3 = json.dumps([h for h, _ in sorted_hl[:3]])
-        result = {
-            "compound": round(compound_avg, 4),
-            "positive": round(pos_avg, 4),
-            "negative": round(neg_avg, 4),
-            "headline_count": len(headlines),
-            "top_headlines": top3,
-            "sentiment_score": 50 + compound_avg * 50,
-        }
-        cache_sentiment(self.conn, keyword, result)
+            r = {"compound":0.0,"positive":0.0,"negative":0.0,
+                 "headline_count":0,"top_headlines":"[]","sentiment_score":50.0}
+            put_cached(self.conn,"sentiment_cache",keyword,r,ttl_hours=4)
+            return r
+        scores = [self._score(h) for h in headlines]
+        c_avg = sum(s["compound"] for s in scores)/len(scores)
+        p_avg = sum(s["pos"] for s in scores)/len(scores)
+        n_avg = sum(s["neg"] for s in scores)/len(scores)
+        top3 = json.dumps([h for h,_ in sorted(zip(headlines,scores), key=lambda x:abs(x[1]["compound"]), reverse=True)[:3]])
+        r = {"compound":round(c_avg,4),"positive":round(p_avg,4),"negative":round(n_avg,4),
+             "headline_count":len(headlines),"top_headlines":top3,"sentiment_score":round(50+c_avg*50,1)}
+        put_cached(self.conn,"sentiment_cache",keyword,r,ttl_hours=4)
+        return r
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  COMPARABLE SALES (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class NameBioComps:
+    def __init__(self, conn): self.conn = conn
+    def fetch(self, keyword: str, niche: str) -> Dict:
+        cached = get_cached(self.conn, "comps_cache", keyword)
+        if cached: return cached
+        sales = self._scrape_namebio(keyword)
+        if not sales:
+            mult = FLIP_MULTIPLES.get(niche, FLIP_MULTIPLES["general"])
+            return {"sales_json":"[]","median_sale":0,"comp_count":0,
+                    "niche_mult_mean":mult["mean"],"niche_mult_std":mult["std"]}
+        median = sorted(sales)[len(sales)//2]
+        result = {"sales_json":json.dumps(sales[:10]), "median_sale":float(median),
+                  "comp_count":len(sales), "niche_mult_mean":FLIP_MULTIPLES.get(niche,FLIP_MULTIPLES["general"])["mean"],
+                  "niche_mult_std":FLIP_MULTIPLES.get(niche,FLIP_MULTIPLES["general"])["std"]}
+        put_cached(self.conn,"comps_cache",keyword,result,ttl_hours=24)
         return result
+    def _scrape_namebio(self, keyword: str) -> List[float]:
+        url = f"https://namebio.com/?s={quote_plus(keyword)}&tld=com&sort=price"
+        resp = http_get(url, timeout=15)
+        if not resp: return []
+        prices = []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for el in soup.select(".price, [data-price], td.amount")[:20]:
+            raw = re.sub(r"[^\d.]", "", el.text.strip())
+            try:
+                p = float(raw)
+                if 100 < p < 1_000_000: prices.append(p)
+            except Exception:
+                pass
+        return prices
 
-# ========== KEYWORD TO DOMAIN GENERATOR ==========
-class KeywordIntel:
-    PREFIXES = ["get", "my", "the", "use", "try", "go", "we", "pro", "smart"]
-    SUFFIXES = ["pro", "hub", "app", "hq", "ai", "io", "lab", "ly", "ify", "base", "desk", "now", "fast", "easy", "plus"]
-    NICHE_TLDS = {
-        "crypto": [".io", ".finance", ".com"],
-        "ai": [".ai", ".io", ".com"],
-        "saas": [".io", ".com", ".app"],
-        "health": [".com", ".care", ".health"],
-        "default": [".com", ".io", ".co"],
-    }
-    def generate(self, keywords: List[Dict], top_n: int = 120) -> List[Tuple[str, str]]:
-        scored = sorted(keywords, key=lambda k: k.get("combined_signal", 0) * 0.5 + k.get("trend_pct", 0) * 0.3 + k.get("velocity", 0) * 0.2, reverse=True)
-        domains = []
-        seen = set()
-        for kw_data in scored[:20]:
-            kw = kw_data["keyword"].lower().strip()
-            if len(kw) < 3 or len(kw) > 18:
-                continue
-            niche = "default"
-            for n in ["crypto", "ai", "saas", "health"]:
-                if n in kw:
-                    niche = n
-                    break
-            tlds = self.NICHE_TLDS.get(niche, self.NICHE_TLDS["default"])
-            combos = [kw] + [f"{p}{kw}" for p in self.PREFIXES] + [f"{kw}{s}" for s in self.SUFFIXES] + [f"{p}{kw}{s}" for p in ["get","my","use"] for s in ["ai","pro","hq"]]
-            for combo in combos:
-                if 3 <= len(combo) <= 18:
-                    for tld in tlds:
-                        domain = f"{combo}{tld}"
-                        if domain not in seen:
-                            seen.add(domain)
-                            domains.append((domain, f"trend:{kw}"))
-        random.shuffle(domains)
-        return domains[:top_n]
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRADEMARK GUARD (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class TrademarkGuard:
+    @staticmethod
+    def check(domain: str) -> Dict:
+        if not ENABLE_TRADEMARK: return {"risk":"UNCHECKED","matches":0,"detail":"disabled"}
+        sld = domain.split(".")[0].lower()
+        url = f"https://tmsearch.uspto.gov/search/search?lang=en&query={quote_plus(sld)}&searchType=statusSearch&status=live&dateRangeField=regDate"
+        resp = http_get(url, timeout=12)
+        if not resp: return {"risk":"UNKNOWN","matches":0,"detail":"USPTO unreachable"}
+        hits = len(re.findall(r'class="result"', resp.text, re.I))
+        if hits == 0: return {"risk":"CLEAR","matches":0,"detail":"No USPTO match"}
+        if hits <= 3: return {"risk":"CAUTION","matches":hits,"detail":"Check manually"}
+        return {"risk":"RISK","matches":hits,"detail":"Active TM found"}
 
-# ========== SCORING HELPERS ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  DOMAIN DISCOVERY (best effort free sources + combo fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_domainsdb(limit=200) -> List[Tuple[str,str]]:
+    data = http_get("https://api.domainsdb.info/v1/domains/search?domain=*.com&limit=200", timeout=20, json_resp=True)
+    if not data: return []
+    out = [(i.get("domain","").lower().strip(), "domainsdb") for i in data.get("domains",[])[:limit] if i.get("domain")]
+    log.info(f"DomainsDB: {len(out)}")
+    return out
+
+def fetch_expireddomains_page1() -> List[Tuple[str,str]]:
+    domains = []
+    try:
+        resp = http_get("https://www.expireddomains.net/deleted-domains/?ftlds[]=com&fwhois=22", timeout=15)
+        if resp:
+            soup = BeautifulSoup(resp.text,"html.parser")
+            for a in soup.select("td.field_domain a[href*='domain-name-search']")[:100]:
+                d = a.text.strip().lower()
+                if d and "." in d: domains.append((d,"expireddomains"))
+    except Exception as e: log.debug(f"ExpiredDomains: {e}")
+    log.info(f"ExpiredDomains: {len(domains)}")
+    return domains
+
+def fetch_dropcatch_feed() -> List[Tuple[str,str]]:
+    domains = []
+    try:
+        p = feedparser.parse("https://www.dropcatch.com/rss/auctions")
+        for e in p.entries[:100]:
+            m = re.search(r"[a-z0-9\-]+\.[a-z]{2,}", getattr(e,"title","").lower())
+            if m: domains.append((m.group(),"dropcatch"))
+    except Exception as e: log.debug(f"DropCatch RSS: {e}")
+    log.info(f"DropCatch: {len(domains)}")
+    return domains
+
+def generate_fallback_domains(limit=100) -> List[Tuple[str,str]]:
+    kws = list(NICHE_SCORE.keys())[:20]
+    tlds = [".com",".io",".ai",".co"]
+    out = [(f"{k}{t}","fallback") for k in kws for t in tlds] + [(f"{k}pro{t}","fallback") for k in kws for t in tlds]
+    random.shuffle(out)
+    return out[:limit]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLASSIC SCORING HELPERS (from v5/v6)
+# ─────────────────────────────────────────────────────────────────────────────
 def get_cc_index() -> str:
     data = http_get("https://index.commoncrawl.org/collinfo.json", timeout=10, json_resp=True)
-    if data:
-        return data[0].get("cdx-api", "https://index.commoncrawl.org/CC-MAIN-2024-10-index")
+    if data: return data[0].get("cdx-api","https://index.commoncrawl.org/CC-MAIN-2024-10-index")
     return "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
-
 CC_INDEX_URL = ""
 
-def wayback_backlinks(domain: str) -> int:
-    url = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}&output=text&fl=urlkey&limit=500&collapse=urlkey"
-    resp = http_get(url, timeout=25)
-    if not resp:
-        return 0
-    ref_domains = set()
-    for line in resp.text.splitlines():
+def wayback_backlinks(domain):
+    r = http_get(f"http://web.archive.org/cdx/search/cdx?url=*.{domain}&output=text&fl=urlkey&limit=500&collapse=urlkey", timeout=25)
+    if not r: return 0
+    refs = set()
+    for line in r.text.splitlines():
         parts = line.strip().split("/")
-        if parts:
-            ref_domains.add(parts[0].replace(")", "").split(",")[-1])
-    return len(ref_domains)
+        if parts: refs.add(parts[0].replace(")","").split(",")[-1])
+    return len(refs)
 
-def wayback_traffic_proxy(domain: str) -> Tuple[int, int]:
-    url = f"http://web.archive.org/cdx/search/cdx?url={domain}&output=json&fl=timestamp&limit=200"
-    resp = http_get(url, timeout=20)
-    if not resp:
-        return 0, 0
+def wayback_traffic_proxy(domain):
+    r = http_get(f"http://web.archive.org/cdx/search/cdx?url={domain}&output=json&fl=timestamp&limit=200", timeout=20)
+    if not r: return 0,0
     try:
-        data = resp.json()
-        count = max(0, len(data) - 1)
-        est = min(count * 300, 50000)
-        return count, est
-    except Exception:
-        return 0, 0
+        d = r.json()
+        c = max(0, len(d)-1)
+        return c, min(c*300, 50000)
+    except: return 0,0
 
-def commoncrawl_presence(domain: str) -> int:
-    if not CC_INDEX_URL:
-        return 0
-    url = f"{CC_INDEX_URL}?url={domain}&output=json&limit=5"
-    resp = http_get(url, timeout=15)
-    if not resp:
-        return 0
-    count = 0
-    for line in resp.text.strip().splitlines():
-        try:
-            json.loads(line.strip())
-            count += 1
-        except Exception:
-            pass
-    return count
+def commoncrawl_presence(domain):
+    if not CC_INDEX_URL: return 0
+    r = http_get(f"{CC_INDEX_URL}?url={domain}&output=json&limit=5", timeout=15)
+    if not r: return 0
+    cnt = 0
+    for line in r.text.strip().splitlines():
+        try: json.loads(line); cnt+=1
+        except: pass
+    return cnt
 
-def domain_age(domain: str) -> int:
+def domain_age(domain):
     try:
         w = whois.whois(domain)
-        creation = w.creation_date
-        if isinstance(creation, list):
-            creation = creation[0]
-        if creation:
-            return min(25, (datetime.now() - creation).days // 365)
-    except Exception:
-        pass
+        c = w.creation_date
+        if isinstance(c,list): c = c[0]
+        if c: return min(25, (datetime.now()-c).days//365)
+    except: pass
     return 0
 
-def detect_niche(domain: str) -> Tuple[str, int]:
-    dl = domain.lower().replace("-", "").replace(".", "")
-    best_niche, best_score = "general", 30
-    for kw, score in NICHE_MAP.items():
-        if kw in dl and score > best_score:
-            best_niche, best_score = kw, score
-    return best_niche, best_score
+def detect_niche(domain):
+    dl = domain.lower().replace("-","").replace(".","")
+    best,bs = "general",30
+    for kw,s in NICHE_SCORE.items():
+        if kw in dl and s>bs: best,bs = kw,s
+    return best,bs
 
-def domain_length_score(domain: str) -> float:
-    sld = domain.split(".")[0]
-    n = len(sld)
-    if n <= 4: return 100
-    if n <= 6: return 90
-    if n <= 8: return 75
-    if n <= 10: return 58
-    if n <= 13: return 40
-    return max(0, 40 - (n - 13) * 3)
+def domain_length_score(domain):
+    n = len(domain.split(".")[0])
+    if n<=4: return 100
+    if n<=6: return 90
+    if n<=8: return 75
+    if n<=10: return 58
+    if n<=13: return 40
+    return max(0,40-(n-13)*3)
 
-def brandability(domain: str) -> float:
+def brandability(domain):
     sld = domain.split(".")[0].lower()
-    score = 50
-    if re.search(r"\d", sld): score -= 20
-    if "-" in sld: score -= 20
-    if len(sld) > 12: score -= 15
-    if len(sld) < 3: score -= 10
-    if re.search(r"[aeiou]{2,}", sld): score += 10
-    if 4 <= len(sld) <= 7: score += 22
-    if sld == sld[::-1] and len(sld) > 2: score += 5
-    vowel_ratio = sum(1 for c in sld if c in "aeiou") / max(1, len(sld))
-    if 0.2 <= vowel_ratio <= 0.5: score += 8
-    return max(0, min(100, score))
+    s = 50
+    if re.search(r"\d", sld): s -= 20
+    if "-" in sld: s -= 20
+    if len(sld)>12: s -= 15
+    if len(sld)<3: s -= 10
+    if re.search(r"[aeiou]{2,}", sld): s += 10
+    if 4<=len(sld)<=7: s += 22
+    if sld==sld[::-1] and len(sld)>2: s += 5
+    vr = sum(1 for c in sld if c in "aeiou")/max(1,len(sld))
+    if 0.2<=vr<=0.5: s += 8
+    return max(0,min(100,s))
 
-def spam_check(domain: str) -> Tuple[int, float]:
-    url = f"http://web.archive.org/cdx/search/cdx?url={domain}&output=json&fl=timestamp&limit=50"
-    resp = http_get(url, timeout=15)
-    if not resp:
-        return 0, 85
+def spam_check(domain):
+    r = http_get(f"http://web.archive.org/cdx/search/cdx?url={domain}&output=json&fl=timestamp&limit=50", timeout=15)
+    if not r: return 0,85
     try:
-        snapshots = resp.json()
-        if len(snapshots) < 2:
-            return 0, 85
-        rows = snapshots[1:]
-        sample = random.sample(rows, min(3, len(rows)))
-        spam_pat = re.compile(r"viagra|cialis|casino|poker|adult|xxx|pharma|pills|escort|gambling", re.I)
+        snaps = r.json()
+        if len(snaps)<2: return 0,85
+        sample = random.sample(snaps[1:], min(3,len(snaps)-1))
+        pat = re.compile(r"viagra|cialis|casino|poker|adult|xxx|pharma|pills|escort|gambling", re.I)
         hits = 0
         for ts in sample:
-            snap_url = f"http://web.archive.org/web/{ts[0]}/{domain}"
-            r = http_get(snap_url, timeout=10, retries=1)
-            if r and spam_pat.search(r.text):
-                hits += 1
+            rr = http_get(f"http://web.archive.org/web/{ts[0]}/{domain}", timeout=10, retries=1)
+            if rr and pat.search(rr.text): hits += 1
             time.sleep(0.3)
-        return hits, max(0, 100 - hits * 35)
-    except Exception:
-        return 0, 85
+        return hits, max(0,100-hits*35)
+    except: return 0,85
 
-def check_safe_browsing(domain: str) -> int:
-    if not SAFE_BROWSING_KEY:
-        return 1
-    body = {
-        "client": {"clientId": "domain-sniper-v6", "clientVersion": "6.0"},
-        "threatInfo": {
-            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": f"http://{domain}"}],
-        }
-    }
+def check_safe_browsing(domain):
+    if not SAFE_BROWSING_KEY: return 1
+    body = {"client":{"clientId":"dsHybrid","clientVersion":"1.0"},
+            "threatInfo":{"threatTypes":["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE"],
+                          "platformTypes":["ANY_PLATFORM"],"threatEntryTypes":["URL"],
+                          "threatEntries":[{"url":f"http://{domain}"}]}}
     try:
-        resp = http_post(f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={SAFE_BROWSING_KEY}", body)
-        return 0 if (resp and resp.json().get("matches")) else 1
-    except Exception:
-        return 1
+        r = http_post(f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={SAFE_BROWSING_KEY}", body)
+        return 0 if (r and r.json().get("matches")) else 1
+    except: return 1
 
-def foundation_score(backlinks: int, cc_hits: int, age: int, tld: str) -> float:
-    bl = min(100, backlinks / 3)
-    cc = min(100, cc_hits * 20)
-    ag = min(100, age * 5)
-    t = TLD_VALUE.get(tld, DEFAULT_TLD)
-    return bl * 0.32 + cc * 0.26 + ag * 0.24 + t * 0.18
+def foundation_score(bl,cc,age,tld):
+    return min(100,bl/3)*0.32 + min(100,cc*20)*0.26 + min(100,age*5)*0.24 + TLD_VALUE.get(tld,DEFAULT_TLD)*0.18
 
-def flip_score_fn(domain: str, niche_cpm: float, age: int, tld: str) -> float:
-    length_s = domain_length_score(domain)
-    brand_s = brandability(domain)
-    tld_s = TLD_VALUE.get(tld, DEFAULT_TLD)
-    if age < 5: age_s = min(100, age * 8)
-    elif age <= 15: age_s = 100
-    else: age_s = max(40, 100 - (age - 15) * 2)
-    return niche_cpm * 0.28 + length_s * 0.27 + brand_s * 0.22 + tld_s * 0.13 + age_s * 0.10
+def flip_score_fn(domain,cpm,age,tld):
+    ls = domain_length_score(domain)
+    bs = brandability(domain)
+    ts = TLD_VALUE.get(tld,DEFAULT_TLD)
+    a_s = min(100,age*8) if age<5 else (100 if age<=15 else max(40,100-(age-15)*2))
+    return cpm*0.28 + ls*0.27 + bs*0.22 + ts*0.13 + a_s*0.10
 
-def sentiment_score_fn(compound: float, headline_count: int, velocity: float, source_count: int) -> float:
-    base = 50 + compound * 50
-    coverage = min(15, headline_count * 0.5) if compound > 0 else max(-15, -headline_count * 0.5)
-    vel_bonus = max(-10, min(10, velocity * 0.3))
-    src_bonus = min(5, source_count * 1.5) if compound >= 0 else 0
-    return max(0.0, min(100.0, base + coverage + vel_bonus + src_bonus))
+def sentiment_score_fn(compound, headline_count, velocity, sources):
+    base = 50 + compound*50
+    cov = min(15, headline_count*0.5) if compound>0 else max(-15, -headline_count*0.5)
+    vel = max(-10, min(10, velocity*0.3))
+    src = min(5, sources*1.5) if compound>=0 else 0
+    return max(0, min(100, base+cov+vel+src))
 
-def momentum_score_fn(trend_pct: float) -> float:
-    return max(0.0, min(100.0, 50.0 + trend_pct / 2.0))
+def momentum_score_fn(tp): return max(0, min(100, 50+tp/2))
 
-def trend_velocity_label(velocity: float) -> str:
-    if velocity > 15: return "🚀 Rocket"
-    if velocity > 5: return "📈 Rising"
-    if velocity > -5: return "➡️ Stable"
-    if velocity > -15: return "📉 Fading"
+def trend_velocity_label(v):
+    if v>15: return "🚀 Rocket"
+    if v>5: return "📈 Rising"
+    if v>-5: return "➡️ Stable"
+    if v>-15: return "📉 Fading"
     return "⬇️ Falling"
 
-def detect_monetization_paths(domain, niche, age, backlinks, monthly_traffic, cc_hits, trend_pct, compound_sentiment):
+def get_weights(age, niche):
+    if age==0: return {"foundation":0.16,"flip":0.22,"history":0.12,"seo":0.18,"sentiment":0.14,"momentum":0.12,"monetization":0.06}
+    if age<3:  return {"foundation":0.18,"flip":0.22,"history":0.14,"seo":0.16,"sentiment":0.14,"momentum":0.10,"monetization":0.06}
+    if age<10: return {"foundation":0.20,"flip":0.20,"history":0.14,"seo":0.16,"sentiment":0.12,"momentum":0.10,"monetization":0.08}
+    return {"foundation":0.24,"flip":0.20,"history":0.18,"seo":0.16,"sentiment":0.08,"momentum":0.08,"monetization":0.06}
+
+def detect_monetization_paths(domain,niche,age,bl,traffic,cc,trend_pct,compound,comps_median):
     paths = []
-    sentiment_multiplier = 1.0 + max(-0.2, min(0.4, compound_sentiment * 0.4))
-    if backlinks > 20 and age >= 3:
-        flip_est = int((backlinks * age * 2.5 + age * 40) * sentiment_multiplier)
-        paths.append(("flip", 0, flip_est, f"List on Sedo/Dan – {age}y aged, {backlinks} BL, sentiment {compound_sentiment:+.2f}"))
+    sm = 1.0 + max(-0.2, min(0.4, compound*0.4))
+    if comps_median > 0:
+        flip_est = int(comps_median * sm)
+    elif bl > 20 and age >= 3:
+        flip_est = int((bl * age * 2.5 + age * 40) * sm)
     elif age >= 5:
-        flip_est = int(age * 35 * sentiment_multiplier)
-        paths.append(("flip", 0, flip_est, f"Aged {age}y domain, sentiment adjusted"))
-    else:
-        flip_est = 0
-    cpm = PARKING_CPM.get(niche, PARKING_CPM["general"])
-    if monthly_traffic > 50:
-        park_mo = (monthly_traffic / 1000) * cpm
-        paths.append(("parking", park_mo, 0, f"Park with Bodis – ~${park_mo:.0f}/mo @ ${cpm} CPM"))
-    if niche in ["ai","saas","crypto","fintech","health","travel","llm"] and age >= 2 and cc_hits > 0:
-        paths.append(("content_site", 5, 0, "5-page niche site + AdSense"))
-    lead_val = LEAD_VALUE.get(niche, 0)
-    if lead_val > 0 and age >= 1:
-        leads_mo = max(1, monthly_traffic // 100) * lead_val
-        paths.append(("lead_gen", leads_mo, 0, f"Lead-gen for {niche} – ~${leads_mo:.0f}/mo"))
-    if niche in ["crypto","fintech","saas","insurance"] and monthly_traffic > 20:
-        aff_mo = (monthly_traffic / 1000) * 15
-        paths.append(("affiliate", aff_mo, 0, f"Affiliate redirect – ~${aff_mo:.0f}/mo"))
-    if not paths:
-        paths.append(("hold_and_list", 0, max(50, flip_est), "List and hold"))
-    paths.sort(key=lambda x: x[1] + x[2] * 0.1, reverse=True)
-    primary = paths[0]
-    secondary = paths[1] if len(paths) > 1 else paths[0]
-    return primary[0], secondary[0], primary[1], flip_est, primary[3]
+        flip_est = int(age * 35 * sm)
+    else: flip_est = 0
+    if flip_est > 0: paths.append(("flip",0,flip_est,f"Sedo/Dan/Afternic – comps ${comps_median:,.0f}"))
+    cpm = PARKING_CPM.get(niche, PARKING_CPM.get("general",3))
+    if traffic>50: paths.append(("parking", (traffic/1000)*cpm, 0, f"Park Bodis ~${(traffic/1000)*cpm:.0f}/mo"))
+    if niche in ["ai","saas","crypto","fintech","health","llm"] and age>=2 and cc>0: paths.append(("content_site",5,0,"5-page niche site + AdSense"))
+    lv = LEAD_VALUE.get(niche,0)
+    if lv>0 and age>=1: paths.append(("lead_gen", max(1,traffic//100)*lv, 0, f"Lead-gen {niche}"))
+    if niche in ["crypto","fintech","saas","insurance"] and traffic>20: paths.append(("affiliate", (traffic/1000)*15, 0, f"Affiliate redirect"))
+    if not paths: paths.append(("hold_and_list",0,max(50,flip_est),"List and hold"))
+    paths.sort(key=lambda x: x[1]+x[2]*0.1, reverse=True)
+    return paths[0][0], paths[1][0] if len(paths)>1 else paths[0][0], paths[0][1], flip_est, paths[0][3]
 
-def monetization_score_fn(monthly_est: float) -> float:
-    return min(100, monthly_est) if monthly_est > 0 else 0
+def monetization_score_fn(me): return min(100,me) if me>0 else 0
 
-def build_affiliate_links(domain: str) -> Dict[str, str]:
+def build_affiliate_links(domain):
     links = {}
-    if AFFILIATE_ID_GD:
-        links["godaddy"] = f"https://www.godaddy.com/domainsearch/find?domainToCheck={domain}&isc={AFFILIATE_ID_GD}"
-    if AFFILIATE_ID_NC:
-        links["namecheap"] = f"https://www.namecheap.com/domains/registration/results/?domain={domain}&AffiliateCode={AFFILIATE_ID_NC}"
-    links["dan_com"] = f"https://dan.com/buy-domain/{domain}"
+    if AFFILIATE_ID_GD: links["godaddy"] = f"https://www.godaddy.com/domainsearch/find?domainToCheck={domain}&isc={AFFILIATE_ID_GD}"
+    if AFFILIATE_ID_NC: links["namecheap"] = f"https://www.namecheap.com/domains/registration/results/?domain={domain}&AffiliateCode={AFFILIATE_ID_NC}"
+    links["dan"] = f"https://dan.com/buy-domain/{domain}"
     links["sedo"] = f"https://sedo.com/search/details/?domain={domain}"
     links["afternic"] = f"https://www.afternic.com/domain/{domain}"
     return links
 
-# ========== DOMAIN PROCESSOR ==========
-def process_domain(domain: str, source: str, conn: sqlite3.Connection, sentiment_engine: SentimentEngine) -> Optional[Dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+#  DOMAIN PROCESSOR (full hybrid)
+# ─────────────────────────────────────────────────────────────────────────────
+_prob_engine = ProbabilityEngine()
+_combo_engine = CombinatoricsEngine()
+
+def process_domain(domain:str, source:str, conn, seo:SEOIntelligence,
+                   sent:SentimentEngine, comps:NameBioComps,
+                   tm:TrademarkGuard) -> Optional[Dict]:
     tld = "." + domain.split(".")[-1]
     sld = domain.split(".")[0]
-    if TLD_VALUE.get(tld, DEFAULT_TLD) < 20:
-        return None
-    if not (2 <= len(sld) <= 22):
-        return None
-    if re.search(r"\d{4,}", sld):
-        return None
-    backlinks = wayback_backlinks(domain)
-    snap_count, traffic = wayback_traffic_proxy(domain)
-    cc_hits = commoncrawl_presence(domain)
+    if TLD_VALUE.get(tld,DEFAULT_TLD) < 20: return None
+    if not (2<=len(sld)<=22): return None
+    if re.search(r"\d{4,}",sld): return None
+
+    bl = wayback_backlinks(domain)
+    snaps, traffic = wayback_traffic_proxy(domain)
+    cc = commoncrawl_presence(domain)
     age = domain_age(domain)
-    niche, niche_cpm = detect_niche(domain)
+    niche, _ = detect_niche(domain)
     spam_flags, hist_s = spam_check(domain)
     safe = check_safe_browsing(domain)
-    kw_for_trend = re.sub(r"\.[a-z]{2,}$", "", sld).replace("-", " ").strip()
-    cached_trend = get_cached_trend(conn, kw_for_trend)
-    if cached_trend:
-        trend_pct, velocity = cached_trend["trend_pct"], cached_trend["velocity"]
-    else:
-        trend_pct, velocity = 0.0, 0.0
-        cache_trend(conn, kw_for_trend, 0.0, 0.0, 1)
-    sent_data = sentiment_engine.analyze(kw_for_trend)
-    compound = sent_data.get("compound", 0.0)
-    headline_count = sent_data.get("headline_count", 0)
-    if not safe:
-        hist_s = min(hist_s, 20)
-    if spam_flags >= 3 and hist_s < 30:
-        add_to_blacklist(conn, domain, f"spam={spam_flags}, hist={hist_s}")
+
+    kw = re.sub(r"\.[a-z]{2,}$","",sld).replace("-"," ").strip()
+    cached_t = get_cached(conn,"trend_cache",kw)
+    trend_pct = cached_t["trend_pct"] if cached_t else 0.0
+    velocity = cached_t["velocity"] if cached_t else 0.0
+
+    sent_data = sent.analyze(kw)
+    compound = sent_data.get("compound",0.0)
+    hn_count = sent_data.get("headline_count",0)
+
+    seo_data = seo.analyze(domain, niche, age, bl, cc, tld)
+    seo_score = seo_data.get("seo_score",50.0)
+
+    comp_data = comps.fetch(kw, niche)
+    comp_med = comp_data.get("median_sale",0)
+
+    tm_risk = tm.check(domain)
+
+    if not safe: hist_s = min(hist_s,20)
+    if spam_flags>=3 and hist_s<30:
+        add_blacklist(conn, domain, f"spam={spam_flags},hist={hist_s}")
         return None
-    W = get_composite_weights(age, niche)
-    found = foundation_score(backlinks, cc_hits, age, tld)
-    flip = flip_score_fn(domain, niche_cpm, age, tld)
-    senti = sentiment_score_fn(compound, headline_count, velocity, 3)
-    moment = momentum_score_fn(trend_pct)
-    pri_path, sec_path, monthly_est, flip_est, mon_note = detect_monetization_paths(
-        domain, niche, age, backlinks, traffic, cc_hits, trend_pct, compound)
-    mon_s = monetization_score_fn(monthly_est)
-    final = int(found * W["foundation"] + flip * W["flip"] + hist_s * W["history"] + senti * W["sentiment"] + moment * W["momentum"] + mon_s * W["monetization"])
+    if tm_risk["risk"] == "RISK":
+        add_blacklist(conn, domain, f"trademark={tm_risk['matches']}")
+        return None
+
+    W = get_weights(age,niche)
+    found = foundation_score(bl,cc,age,tld)
+    flip = flip_score_fn(domain, NICHE_SCORE.get(niche,30), age, tld)
+    senti = sentiment_score_fn(compound, hn_count, velocity, 3)
+    mom = momentum_score_fn(trend_pct)
+    pri,sec,me,flip_est,mon_note = detect_monetization_paths(
+        domain,niche,age,bl,traffic,cc,trend_pct,compound,comp_med)
+    mon_s = monetization_score_fn(me)
+
+    final = int(
+        found*W["foundation"] + flip*W["flip"] + hist_s*W["history"] +
+        seo_score*W["seo"] + senti*W["sentiment"] + mom*W["momentum"] + mon_s*W["monetization"]
+    )
+
+    p_win = _prob_engine.p_flip_success(final, niche, age, bl)
+    mc = _prob_engine.monte_carlo_flip_value(max(flip_est,me), niche)
+    kelly = _prob_engine.kelly_allocation(p_win, mc["p50"])
     aff = build_affiliate_links(domain)
+    cps, best_combo, _ = _combo_engine.score_combination([sld], tld)  # simplified
+
     return {
         "fetched_at": datetime.utcnow().isoformat(),
         "domain": domain, "source": source, "tld": tld, "sld_length": len(sld),
         "final_score": final,
-        "foundation": round(found, 1), "flip_score": round(flip, 1),
-        "history_score": round(hist_s, 1), "sentiment_score": round(senti, 1),
-        "momentum_score": round(moment, 1), "monetization_score": round(mon_s, 1),
-        "age_years": age, "backlinks_proxy": backlinks, "wayback_snapshots": snap_count,
-        "est_monthly_traffic": traffic, "commoncrawl_hits": cc_hits,
-        "niche": niche, "niche_cpm": niche_cpm,
-        "trend_6m_pct": trend_pct, "trend_velocity": velocity, "velocity_label": trend_velocity_label(velocity),
-        "sentiment_compound": round(compound, 4), "sentiment_headline_n": headline_count, "top_headlines": sent_data.get("top_headlines", "[]"),
+        "foundation": round(found,1), "flip_score": round(flip,1),
+        "history_score": round(hist_s,1), "seo_score": round(seo_score,1),
+        "sentiment_score": round(senti,1), "momentum_score": round(mom,1),
+        "monetization_score": round(mon_s,1),
+        "seo_intent_class": seo_data.get("intent_class","?"),
+        "seo_cpc_usd": seo_data.get("cpc",0),
+        "age_years": age, "backlinks_proxy": bl,
+        "wayback_snapshots": snaps, "est_monthly_traffic": traffic,
+        "commoncrawl_hits": cc,
+        "niche": niche, "niche_cpc": NICHE_CPC.get(niche,0.5),
+        "trend_6m_pct": trend_pct, "trend_velocity": velocity,
+        "velocity_label": trend_velocity_label(velocity),
+        "sentiment_compound": round(compound,4),
+        "sentiment_headline_n": hn_count,
+        "top_headlines": sent_data.get("top_headlines","[]"),
         "spam_flags": spam_flags, "safe_browsing_clean": safe,
-        "primary_path": pri_path, "secondary_path": sec_path, "est_monthly_usd": round(monthly_est, 2),
-        "flip_estimate_usd": flip_est, "flip_range": f"${flip_est*.8:.0f}–${flip_est*1.2:.0f}" if flip_est else "TBD",
+        "trademark_risk": tm_risk["risk"],
+        "combinatoric_cps": round(cps,2), "best_combo": best_combo,
+        "comp_median_usd": comp_med, "comp_count": comp_data.get("comp_count",0),
+        "p_flip_success": p_win,
+        "mc_mean": mc["mean"], "mc_p10": mc["p10"], "mc_p50": mc["p50"],
+        "mc_p90": mc["p90"], "mc_ci95": mc["ci95"],
+        "kelly_fraction": kelly["f_star"], "kelly_alloc_usd": kelly["allocation_usd"],
+        "kelly_verdict": kelly["verdict"], "payoff_ratio": kelly["payoff_ratio"],
+        "expected_value": kelly["expected_value"],
+        "primary_path": pri, "secondary_path": sec,
+        "est_monthly_usd": round(me,2), "flip_estimate_usd": flip_est,
+        "flip_range": f"${flip_est*.8:,.0f}–${flip_est*1.2:,.0f}" if flip_est else "TBD",
         "monetization_note": mon_note,
-        "link_sedo": aff.get("sedo", ""), "link_dan": aff.get("dan_com", ""), "link_afternic": aff.get("afternic", ""),
-        "link_godaddy_aff": aff.get("godaddy", ""), "link_namecheap_aff": aff.get("namecheap", ""),
+        "link_sedo": aff.get("sedo",""), "link_dan": aff.get("dan",""),
+        "link_afternic": aff.get("afternic",""), "link_godaddy_aff": aff.get("godaddy",""),
+        "link_namecheap_aff": aff.get("namecheap",""),
         "weights_used": json.dumps(W),
     }
 
-def process_domain_safe(args: Tuple) -> Optional[Dict]:
-    domain, source, conn, sent = args
-    try:
-        return process_domain(domain, source, conn, sent)
-    except Exception as e:
-        log.error(f"Error processing {domain}: {e}")
-        traceback.print_exc()
-        return None
+def process_domain_safe(args):
+    domain,src,conn,seo,sent,comps,tm = args
+    try: return process_domain(domain,src,conn,seo,sent,comps,tm)
+    except Exception as e: log.error(f"Error {domain}: {e}"); return None
 
-# ========== OUTPUTS ==========
-def push_to_sheets(df: pd.DataFrame):
-    if not GSPREAD_AVAILABLE or not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
-        log.warning("Google Sheets skipped (missing config/gspread)")
-        return
-    try:
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-        client = gspread.authorize(creds)
-        sh = client.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            ws = sh.worksheet(SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=SHEET_NAME, rows=2000, cols=40)
-        headers = df.columns.tolist()
-        values = [headers] + df.fillna("").astype(str).values.tolist()
-        existing = ws.get_all_values()
-        if not existing:
-            ws.update(values, value_input_option="RAW")
-        else:
-            ws.append_rows(values[1:], value_input_option="RAW")
-        log.info(f"Google Sheets: pushed {len(df)} rows")
-    except Exception as e:
-        log.error(f"Sheets push failed: {e}")
-
-def send_telegram(d: Dict):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    path_emoji = {"flip": "💸", "parking": "🅿️", "lead_gen": "🎯", "affiliate": "🔗", "content_site": "📝", "hold_and_list": "⏳"}
-    sent_emoji = "🟢" if d["sentiment_compound"] > 0.1 else "🔴" if d["sentiment_compound"] < -0.1 else "⚪"
-    msg = (
-        f"🏆 *DOMAIN PEARL v6* — Score {d['final_score']}/100\n"
-        f"🌐 *{d['domain']}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Foundation: {d['foundation']:.0f}  │  Flip: {d['flip_score']:.0f}\n"
-        f"History: {d['history_score']:.0f}  │  Momentum: {d['momentum_score']:.0f}\n"
-        f"{sent_emoji} Sentiment: {d['sentiment_score']:.0f}  │  Velocity: {d['velocity_label']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷 Niche: *{d['niche']}*  │  Age: {d['age_years']}y\n"
-        f"📊 Traffic: ~{d['est_monthly_traffic']:,}/mo  │  BL: {d['backlinks_proxy']}\n"
-        f"📰 Headlines: {d['sentiment_headline_n']}  │  Compound: {d['sentiment_compound']:+.3f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{path_emoji.get(d['primary_path'], '💡')} *{d['primary_path'].replace('_',' ').title()}*\n"
-        f"💰 Monthly: ${d['est_monthly_usd']:.0f}  │  Flip: {d['flip_range']}\n"
-        f"📋 {d['monetization_note']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 [Sedo]({d['link_sedo']}) │ [Dan]({d['link_dan']}) │ [Afternic]({d['link_afternic']})\n"
-        f"⚡ Source: {d['source']}"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for i in range(0, len(msg), 4000):
-        try:
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[i:i+4000], "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=10)
-        except Exception:
-            pass
-
-def send_email_digest(results: List[Dict]):
-    if not EMAIL_DIGEST_TO or not GMAIL_USER or not GMAIL_APP_PASS or not results:
-        return
-    top = sorted(results, key=lambda x: x["final_score"], reverse=True)[:12]
-    html_rows = ""
-    for d in top:
-        sent_color = "#22c55e" if d["sentiment_compound"] > 0.1 else "#ef4444" if d["sentiment_compound"] < -0.1 else "#94a3b8"
-        html_rows += f"""
-        <tr>
-          <td><b>{d['domain']}</b><br><small>{d['source']}</small></td>
-          <td align="center"><b>{d['final_score']}</b></td>
-          <td>{d['niche']}</td>
-          <td>{d['primary_path'].replace('_',' ').title()}</td>
-          <td align="center"><span style="color:{sent_color}">{d['sentiment_compound']:+.2f}</span><br><small>{d['velocity_label']}</small></td>
-          <td align="center">${d['est_monthly_usd']:.0f}/mo</td>
-          <td>{d['flip_range']}</td>
-          <td><a href="{d['link_sedo']}">Sedo</a> │ <a href="{d['link_dan']}">Dan</a></td>
+# ─────────────────────────────────────────────────────────────────────────────
+#  OUTPUT: HTML REPORT, GOOGLE SHEETS, TELEGRAM, EMAIL
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_html_report(df: pd.DataFrame, run_id: str) -> str:
+    top = df.head(20)
+    rows = ""
+    for _,r in top.iterrows():
+        sc = r["final_score"]
+        bg = "#dcfce7" if sc>=75 else "#fef9c3" if sc>=60 else "#fee2e2"
+        sent_col = "#16a34a" if r["sentiment_compound"]>0.1 else "#dc2626" if r["sentiment_compound"]<-0.1 else "#64748b"
+        kelly_col = "#16a34a" if r["kelly_verdict"]=="Strong Buy" else "#ca8a04" if r["kelly_verdict"]=="Buy" else "#64748b"
+        rows += f"""
+        <tr style="background:{bg}">
+          <td><b><a href="https://{r['domain']}" target="_blank">{r['domain']}</a></b><br><small>{r['source']}</small></td>
+          <td align="center"><b>{sc}</b></td>
+          <td>{r['niche']} <br> <small>{r['seo_intent_class']}</small></td>
+          <td align="center"><span style="color:{sent_col}">{r['sentiment_compound']:+.2f}</span><br>{r['velocity_label']}</td>
+          <td align="center">{r['p_flip_success']:.0%} </td>
+          <td align="center">{r['mc_ci95']}</td>
+          <td align="center"><b style="color:{kelly_col}">{r['kelly_verdict']}</b><br>${r['kelly_alloc_usd']:,.0f}</td>
+          <td>{r['primary_path'].replace('_',' ').title()}</td>
+          <td><a href="{r['link_sedo']}">Sedo</a> <a href="{r['link_dan']}">Dan</a> <a href="{r['link_afternic']}">Afternic</a></td>
         </tr>"""
     html = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:780px;margin:auto;color:#1e293b">
-    <h2 style="color:#6366f1">🏴‍☠️ Domain Sniper PRO v6 – Daily Intelligence Digest</h2>
-    <p>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} │ {len(results)} domains scanned</p>
-    <table border="1" cellpadding="6" style="border-collapse:collapse;width:100%;font-size:13px">
-      <tr style="background:#1e1b4b;color:white"><th>Domain</th><th>Score</th><th>Niche</th><th>Best Path</th><th>Sentiment / Velocity</th><th>Monthly</th><th>Flip Range</th><th>Links</th></tr>
-      {html_rows}
-     </table>
-    <p style="font-size:10px;color:#94a3b8;margin-top:20px">Domain Sniper PRO v6 – automated estimates only. DYOR before purchasing.</p>
-    </body></html>"""
+    <html><head><meta charset="utf-8"><title>Domain Sniper Hybrid – {run_id}</title>
+    <style>body{{font-family:Arial;max-width:1200px;margin:auto;padding:20px;color:#1e293b}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}
+    th{{background:#1e1b4b;color:white;padding:6px}} td{{padding:5px;border:1px solid #e2e8f0}}
+    </style></head><body>
+    <h1>🏴‍☠️ Domain Sniper Hybrid – Institutional Report</h1>
+    <p><b>Run:</b> {run_id} | <b>Date:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | <b>Scored:</b> {len(df)}</p>
+    <table><tr><th>Domain</th><th>Score</th><th>Niche/Intent</th><th>Sentiment/Vel</th><th>P(Flip)</th><th>MC 95% CI</th><th>Kelly/$</th><th>Path</th><th>Links</th></tr>
+    {rows}
+    </table><p style="font-size:10px;color:#94a3b8">Not financial advice. DYOR.</p></body></html>"""
+    path = f"report_hybrid_{run_id}.html"
+    with open(path,"w",encoding="utf-8") as f: f.write(html)
+    log.info(f"HTML report: {path}")
+    return path
+
+def push_to_sheets(df):
+    if not GSPREAD_OK or not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID: return
+    try:
+        creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS_JSON),
+                      scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
+        sh = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+        try: ws = sh.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound: ws = sh.add_worksheet(SHEET_NAME,2000,40)
+        vals = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+        ws.update(vals, value_input_option="RAW") if not ws.get_all_values() else ws.append_rows(vals[1:])
+        log.info(f"Sheets: {len(df)} rows")
+    except Exception as e: log.error(f"Sheets error: {e}")
+
+def send_telegram(d):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    emoji={"flip":"💸","parking":"🅿️","lead_gen":"🎯","affiliate":"🔗","content_site":"📝","hold_and_list":"⏳"}
+    se="🟢" if d["sentiment_compound"]>0.1 else "🔴" if d["sentiment_compound"]<-0.1 else "⚪"
+    ke={"Strong Buy":"🔥","Buy":"✅","Small":"🔹"}.get(d["kelly_verdict"],"⬜")
+    msg = (f"🏆 *PEARL* {d['final_score']}/100\n🌐 *{d['domain']}*\n"
+           f"Foundation:{d['foundation']:.0f} Flip:{d['flip_score']:.0f} SEO:{d['seo_score']:.0f}\n"
+           f"{se} Sentiment:{d['sentiment_score']:.0f} Vel:{d['velocity_label']}\n"
+           f"Niche:{d['niche']} Age:{d['age_years']}y CPC:${d['seo_cpc_usd']:.2f}\n"
+           f"━━━━━━━━━━━━━━━━━━━━\n"
+           f"📊 P(flip): {d['p_flip_success']:.0%} MC 95% CI: {d['mc_ci95']}\n"
+           f"{ke} Kelly: {d['kelly_verdict']} — ${d['kelly_alloc_usd']:,.0f}\n"
+           f"━━━━━━━━━━━━━━━━━━━━\n"
+           f"{emoji.get(d['primary_path'],'💡')} {d['primary_path'].replace('_',' ').title()}\n"
+           f"Monthly:${d['est_monthly_usd']:.0f} Flip:{d['flip_range']}\n"
+           f"[Sedo]({d['link_sedo']}) [Dan]({d['link_dan']}) [Afternic]({d['link_afternic']})")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for i in range(0,len(msg),4000):
+        try: requests.post(url, json={"chat_id":TELEGRAM_CHAT_ID,"text":msg[i:i+4000],"parse_mode":"Markdown","disable_web_page_preview":True}, timeout=10)
+        except: pass
+
+def send_email_digest(results):
+    if not EMAIL_DIGEST_TO or not GMAIL_USER or not GMAIL_APP_PASS or not results: return
+    top = sorted(results, key=lambda x: x["final_score"], reverse=True)[:12]
+    rows = ""
+    for d in top:
+        kc = "#16a34a" if d["kelly_verdict"]=="Strong Buy" else "#ca8a04" if d["kelly_verdict"]=="Buy" else "#64748b"
+        rows += f"<tr><td><b>{d['domain']}</b><br><small>{d['source']}</small></td><td align='center'><b>{d['final_score']}</b></td><td>{d['niche']}</td><td>{d['p_flip_success']:.0%}</td><td>{d['mc_ci95']}</td><td><b style='color:{kc}'>{d['kelly_verdict']}</b><br>${d['kelly_alloc_usd']:,.0f}</td><td><a href='{d['link_sedo']}'>Sedo</a></td></tr>"
+    html = (f"<html><body><h2>Domain Sniper Hybrid – Daily Digest</h2><p>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | {len(results)} scored</p>"
+            f"<table border='1' cellpadding='5'><tr><th>Domain</th><th>Score</th><th>Niche</th><th>P(Flip)</th><th>MC CI95</th><th>Kelly/$</th><th>Buy</th></tr>{rows}</table>"
+            f"<p>Not advice. DYOR.</p></body></html>")
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🏴‍☠️ Domain Sniper PRO v6 – {len(top)} Pearls ({datetime.utcnow().strftime('%Y-%m-%d')})"
+    msg["Subject"] = f"Domain Sniper Hybrid – {len(top)} Pearls ({datetime.utcnow().strftime('%Y-%m-%d')})"
     msg["From"] = GMAIL_USER
     msg["To"] = EMAIL_DIGEST_TO
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(html,"html"))
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        with smtplib.SMTP_SSL("smtp.gmail.com",465) as s:
             s.login(GMAIL_USER, GMAIL_APP_PASS)
             s.sendmail(GMAIL_USER, EMAIL_DIGEST_TO, msg.as_string())
-        log.info("Email digest sent.")
-    except Exception as e:
-        log.error(f"Email error: {e}")
+        log.info("Email digest sent")
+    except Exception as e: log.error(f"Email error: {e}")
 
-# ========== MAIN ==========
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     global CC_INDEX_URL
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    log.info("=" * 70)
-    log.info("  Domain Fortress Sniper PRO  v6 – Fixed & Production Ready")
-    log.info("=" * 70)
-    log.info(f"Run ID: {run_id}")
-    log.info(f"VADER: {'✓' if VADER_AVAILABLE else '✗'}")
-    log.info(f"pytrends: {'✓' if PYTRENDS_AVAILABLE else '✗'}")
-    log.info(f"gspread: {'✓' if GSPREAD_AVAILABLE else '✗'}")
-    log.info("=" * 70)
+    log.info("═"*70)
+    log.info("  Domain Fortress Sniper – Hybrid Edition")
+    log.info("═"*70)
+    log.info(f"Run: {run_id}")
+    log.info(f"VADER: {'✓' if VADER_OK else '✗'}")
+    log.info(f"pytrends: {'✓' if PYTRENDS_OK else '✗'}")
+    log.info(f"numpy: {'✓' if NUMPY_OK else '✗'}")
+    log.info(f"gspread: {'✓' if GSPREAD_OK else '✗'}")
+    log.info(f"Trademark: {'ON' if ENABLE_TRADEMARK else 'OFF'}")
+    log.info(f"Bankroll: ${KELLY_BANKROLL:,.0f}")
+    log.info("═"*70)
 
     conn = init_db()
     CC_INDEX_URL = get_cc_index()
     log.info(f"CommonCrawl index: {CC_INDEX_URL}")
 
+    # Shared engines
+    seo_engine = SEOIntelligence(conn)
+    sent_engine = SentimentEngine(conn)
+    comps_engine = NameBioComps(conn)
+    tm_guard = TrademarkGuard()
+
+    # Trend radar
     radar = TrendRadar(conn)
     if CUSTOM_KEYWORDS:
-        trending = [{"keyword": k, "combined_signal": 100, "trend_pct": 0, "velocity": 0,
-                     "in_hn": False, "in_reddit": False, "in_rss": False, "in_crypto": False}
+        trending = [{"keyword":k,"combined_signal":100,"trend_pct":0,"velocity":0,
+                     "in_hn":False,"in_reddit":False,"in_rss":False,"in_crypto":False}
                     for k in CUSTOM_KEYWORDS]
-        log.info(f"Using custom keywords: {CUSTOM_KEYWORDS}")
+        log.info(f"Custom keywords: {CUSTOM_KEYWORDS}")
     else:
         trending = radar.get_trending_keywords(top_n=30)
     log.info(f"Top 5 trending: {[k['keyword'] for k in trending[:5]]}")
 
-    all_domains = fetch_namebeta(limit=200)
+    # Combinatorics candidates
+    log.info("Generating candidate domains from trends…")
+    combo_candidates = _combo_engine.generate_candidates(trending, top_n=150)
+    log.info(f"Combo candidates: {len(combo_candidates)}")
+
+    # Domain discovery (best effort)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_db  = ex.submit(fetch_domainsdb, 200)
+        f_exp = ex.submit(fetch_expireddomains_page1)
+        f_dc  = ex.submit(fetch_dropcatch_feed)
+        all_domains = f_db.result() + f_exp.result() + f_dc.result()
+    all_domains += [(d,s) for d,s,_ in combo_candidates]
     if not all_domains:
-        log.warning("Namebeta returned 0, trying fallback sources...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f_exp = ex.submit(fetch_expireddomains_rss)
-            f_nc = ex.submit(fetch_namecheap_drops)
-            all_domains = f_exp.result() + f_nc.result()
-    if not all_domains:
-        log.warning("All real sources returned 0 – using trend-generated domains")
-        intel = KeywordIntel()
-        all_domains = intel.generate(trending, top_n=150)
-    if not all_domains:
-        all_domains = generate_fallback_domains(100)
+        all_domains = generate_fallback_domains(150)
 
     log.info(f"Total raw candidates: {len(all_domains)}")
     seen_set = set()
     unique = []
-    for d, src in all_domains:
+    for d,src in all_domains:
         d = d.strip().lower()
-        if d and "." in d and d not in seen_set and not is_seen(conn, d) and not is_blacklisted(conn, d):
+        if d and "." in d and len(d)<60 and d not in seen_set and not is_seen(conn,d) and not is_blacklisted(conn,d):
             seen_set.add(d)
-            unique.append((d, src))
+            unique.append((d,src))
+    unique = unique[:MAX_DOMAINS]
     log.info(f"Unique new domains to score: {len(unique)}")
     if not unique:
-        pd.DataFrame(columns=["domain", "final_score"]).to_csv(f"domains_v6_{run_id}.csv", index=False)
+        pd.DataFrame(columns=["domain","final_score"]).to_csv(f"domains_hybrid_{run_id}.csv", index=False)
         conn.close()
         return
 
-    sentiment_engine = SentimentEngine(conn)
+    # Parallel scoring
     results = []
-    args_list = [(d, src, conn, sentiment_engine) for d, src in unique]
+    args = [(d,s,conn,seo_engine,sent_engine,comps_engine,tm_guard) for d,s in unique]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_domain_safe, args): args[0] for args in args_list}
+        futures = {ex.submit(process_domain_safe, a):a[0] for a in args}
         for fut in concurrent.futures.as_completed(futures):
-            d_name = futures[fut]
+            dname = futures[fut]
             try:
                 data = fut.result()
                 if data and data["final_score"] >= SCORE_FLOOR:
                     results.append(data)
-                    mark_seen(conn, d_name, data["final_score"], data["primary_path"])
-                    log.info(f"✓ {d_name:38s} score={data['final_score']:3d}  niche={data['niche']:12s}  sent={data['sentiment_compound']:+.2f}  vel={data['velocity_label']}")
-            except Exception as e:
-                log.error(f"Future error {d_name}: {e}")
+                    mark_seen(conn, dname, data["final_score"], data["primary_path"])
+                    log.info(f"✓ {dname:38s} score={data['final_score']:3d}  SEO={data['seo_score']:.0f}  P(flip)={data['p_flip_success']:.0%}  Kelly={data['kelly_verdict']}")
+            except Exception as e: log.error(f"Future error {dname}: {e}")
+
     if not results:
         log.warning("No domains passed score floor")
-        pd.DataFrame(columns=["domain", "final_score"]).to_csv(f"domains_v6_{run_id}.csv", index=False)
+        pd.DataFrame(columns=["domain","final_score"]).to_csv(f"domains_hybrid_{run_id}.csv", index=False)
         conn.close()
         return
 
+    # Outputs
     df = pd.DataFrame(results).sort_values("final_score", ascending=False)
-    csv_path = f"domains_v6_{run_id}.csv"
+    csv_path = f"domains_hybrid_{run_id}.csv"
     df.to_csv(csv_path, index=False)
-    log.info(f"CSV saved: {csv_path}  ({len(df)} rows)")
+    log.info(f"CSV: {csv_path} ({len(df)} rows)")
+    html_path = generate_html_report(df, run_id)
     push_to_sheets(df)
 
     pearls = df[df["final_score"] >= MIN_ALERT_SCORE]
-    log.info(f"Pearls (score ≥ {MIN_ALERT_SCORE}): {len(pearls)}")
-    for _, row in pearls.iterrows():
-        send_telegram(row.to_dict())
-        time.sleep(1)
+    log.info(f"Pearls (score≥{MIN_ALERT_SCORE}): {len(pearls)}")
+    for _,row in pearls.iterrows(): send_telegram(row.to_dict()); time.sleep(1)
     send_email_digest(results)
 
+    # Stats
     best = df.iloc[0]
-    conn.execute("INSERT OR REPLACE INTO run_stats VALUES (?,?,?,?,?,?,?)",
-                 (run_id, run_id[:15], datetime.utcnow().isoformat(),
-                  len(results), len(pearls), best["domain"], int(best["final_score"])))
-    conn.commit()
+    db_write(conn,"INSERT OR REPLACE INTO run_stats VALUES(?,?,?,?,?,?,?)",
+             (run_id, run_id[:15], datetime.utcnow().isoformat(), len(results), len(pearls), best["domain"], int(best["final_score"])))
 
-    log.info("═" * 70)
+    log.info("═"*70)
     log.info("  FINAL SUMMARY")
-    log.info(f"  Domains scored      : {len(results)}")
-    log.info(f"  Pearls found        : {len(pearls)}")
-    log.info(f"  Best domain         : {best['domain']}  (score {best['final_score']})")
-    log.info(f"  Best niche          : {best['niche']}")
-    log.info(f"  Best sentiment      : {best['sentiment_compound']:+.3f}  {best['velocity_label']}")
-    log.info(f"  Best path           : {best['primary_path']} → {best['monetization_note']}")
-    log.info(f"  CSV output          : {csv_path}")
-    log.info("═" * 70)
-
+    log.info(f"  Domains scored     : {len(results)}")
+    log.info(f"  Pearls found       : {len(pearls)}")
+    log.info(f"  Best domain        : {best['domain']}  (score {best['final_score']})")
+    log.info(f"  P(flip success)    : {best['p_flip_success']:.0%}")
+    log.info(f"  Kelly verdict      : {best['kelly_verdict']}  (alloc ${best['kelly_alloc_usd']:,.0f})")
+    log.info(f"  CSV                : {csv_path}")
+    log.info(f"  HTML report        : {html_path}")
+    log.info("═"*70)
     conn.close()
     log.info("Done.")
 
