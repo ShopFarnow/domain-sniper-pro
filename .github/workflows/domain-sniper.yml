@@ -35,8 +35,12 @@ jobs:
           path: domain_sniper.db
           key: sniper-db-${{ github.run_id }}
           restore-keys: sniper-db-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Upgrade pip & setuptools
+  run: pip install --upgrade pip setuptools wheel
+
+- name: Install dependencies
+  run: pip install -r requirements.txt
+  
       - name: Run Domain Sniper PRO
         run: python domain_sniper_pro.py
       - name: Upload CSV output
