@@ -1,9 +1,8 @@
-requests==2.31.0
-beautifulsoup4==4.12.3
-lxml==4.9.3
-pandas==2.0.3
-numpy==1.24.3
-pytrends==4.9.2
-python-whois==0.8.0
-gspread==5.12.0
-google-auth==2.23.4
+requests
+pandas
+beautifulsoup4
+lxml
+python-whois
+pytrends
+gspread
+google-auth
