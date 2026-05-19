@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Domain Fortress Sniper PRO – Zero Investment Monetization
-ENHANCED v3.0 (Audit fixes + blacklist + dynamic CC + monetization scoring)
+Domain Fortress Sniper PRO – Enhanced Error Logging
 """
 
-import os, re, time, json, sqlite3, logging, smtplib, random
+import os, sys, re, time, json, sqlite3, logging, smtplib, random, traceback
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from collections import defaultdict
-from urllib.parse import urlparse
 
 import requests
 import pandas as pd
@@ -18,6 +15,14 @@ import whois
 from pytrends.request import TrendReq
 import gspread
 from google.oauth2.service_account import Credentials
+
+# ========== FORCE PRINT ALL LOGS TO STDOUT (GitHub Actions sees them) ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger(__name__)
 
 # ========== CONFIGURATION (all from env) ==========
 TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
@@ -34,10 +39,7 @@ AFFILIATE_ID_GD     = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC     = os.getenv("AFFILIATE_ID_NC", "")
 DB_PATH             = os.getenv("DB_PATH", "domain_sniper.db")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
-
-# ========== SCORING CONSTANTS ==========
+# ========== SCORING CONSTANTS (same as before) ==========
 TLD_VALUE = {".com":100,".io":88,".ai":85,".co":75,".net":60,".org":55,".in":45,".us":40}
 DEFAULT_TLD = 15
 
@@ -63,7 +65,7 @@ LEAD_VALUE = {
 
 WEIGHTS = {"foundation":0.28, "flip":0.32, "history":0.20, "momentum":0.12, "monetization":0.08}
 
-# ========== SQLite (persistent memory) ==========
+# ========== SQLite ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -102,7 +104,13 @@ def add_to_blacklist(conn, domain, reason):
     conn.commit()
     log.info(f"Blacklisted {domain}: {reason}")
 
-# ========== DATA FETCHERS (free) ==========
+# ========== DATA FETCHERS ==========
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+]
+
 def fetch_expireddomains(limit=80):
     url = "https://www.expireddomains.net/deleting-domains/"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
@@ -118,9 +126,11 @@ def fetch_expireddomains(limit=80):
                 d = cols[1].get_text(strip=True).lower()
                 if d and "." in d:
                     domains.append((d, "expired"))
+        log.info(f"expireddomains.net: {len(domains)} domains")
         return domains
     except Exception as e:
-        log.error(f"expireddomains error: {e}")
+        log.error(f"expireddomains.net error: {e}")
+        traceback.print_exc()
         return []
 
 def fetch_dropcatch(limit=40):
@@ -134,9 +144,11 @@ def fetch_dropcatch(limit=40):
             d = tag.get_text(strip=True).lower()
             if d and "." in d:
                 domains.append((d, "auction"))
+        log.info(f"dropcatch.com: {len(domains)} domains")
         return domains
     except Exception as e:
-        log.error(f"dropcatch error: {e}")
+        log.error(f"dropcatch.com error: {e}")
+        traceback.print_exc()
         return []
 
 def fetch_expireddomains_keyword(keyword, limit=20):
@@ -156,31 +168,23 @@ def fetch_expireddomains_keyword(keyword, limit=20):
                     domains.append((d, f"keyword:{keyword}"))
         return domains
     except Exception as e:
-        log.error(f"keyword search error ({keyword}): {e}")
+        log.error(f"Keyword search '{keyword}' error: {e}")
+        traceback.print_exc()
         return []
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-]
-
-# ========== DYNAMIC COMMONCRAWL INDEX ==========
 def get_latest_cc_index():
-    """Fetch the most recent CommonCrawl index URL."""
     try:
         resp = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=10)
         data = resp.json()
-        # choose the latest (first in list? Usually sorted descending)
         if data:
             return data[0]["cdx-api"]
     except Exception as e:
         log.warning(f"Could not fetch CC index: {e}")
-    return "https://index.commoncrawl.org/CC-MAIN-2024-10-index"  # fallback
+    return "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
 
 CC_INDEX_URL = get_latest_cc_index()
 
-# ========== SCORING HELPERS ==========
+# ========== SCORING HELPERS (all with error logging) ==========
 def wayback_backlinks(domain):
     url = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}&output=text&fl=urlkey&limit=500&collapse=urlkey"
     try:
@@ -202,7 +206,6 @@ def wayback_traffic_proxy(domain):
         resp = requests.get(url, timeout=15)
         data = resp.json()
         count = max(0, len(data) - 1)
-        # Heuristic: each snapshot ~ 300 unique monthly visits (very rough)
         est_monthly = min(count * 300, 50000)
         return count, est_monthly
     except Exception:
@@ -227,12 +230,11 @@ def domain_age(domain):
             creation = creation[0]
         if creation:
             return min(25, (datetime.now() - creation).days // 365)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"WHOIS error for {domain}: {e}")
     return 0
 
 def google_trends_score(keyword):
-    """Retry with backoff and random user agent."""
     for attempt in range(3):
         try:
             pytrends = TrendReq(hl="en-US", tz=330, timeout=(10, 25))
@@ -328,13 +330,10 @@ def check_safe_browsing(domain):
     except Exception:
         return 1
 
-# ========== MONETIZATION ENGINE (fixed) ==========
+# ========== MONETIZATION ENGINE ==========
 def detect_monetization_paths(domain, niche, age, backlinks, monthly_traffic, cc_hits, trend_pct):
-    """Returns (primary_path, secondary_path, monthly_est_usd, flip_estimate_usd, explanation)."""
     paths = []
     flip_estimate = 0
-
-    # ---- PATH A: IMMEDIATE FLIP (one‑time value) ----
     if backlinks > 20 and age >= 3:
         flip_estimate = max(200, backlinks * 8 + age * 50)
         paths.append(("flip", 0, flip_estimate, f"List on Sedo/Dan/Afternic – aged domain with backlinks"))
@@ -342,24 +341,20 @@ def detect_monetization_paths(domain, niche, age, backlinks, monthly_traffic, cc
         flip_estimate = age * 30
         paths.append(("flip", 0, flip_estimate, f"List on Sedo/Dan/Afternic – aged domain"))
 
-    # ---- PATH B: PARKING (monthly) ----
     cpm = PARKING_CPM.get(niche, PARKING_CPM["general"])
     if monthly_traffic > 50:
         park_monthly = (monthly_traffic / 1000) * cpm
         paths.append(("parking", park_monthly, 0, f"Park with Bodis/ParkingCrew – est. ${park_monthly:.0f}/mo at ${cpm} CPM"))
 
-    # ---- PATH C: MICRO CONTENT SITE + ADS ----
     if niche in ["ai", "saas", "crypto", "fintech", "health", "travel"] and age >= 2 and cc_hits > 0:
-        site_monthly = 5  # conservative starting AdSense revenue
+        site_monthly = 5
         paths.append(("content_site", site_monthly, 0, "Build 5-page niche site + Google AdSense"))
 
-    # ---- PATH D: LEAD GEN LANDING PAGE ----
     lead_val = LEAD_VALUE.get(niche, 0)
     if lead_val > 0 and age >= 1:
         leads_monthly = max(1, monthly_traffic // 100) * lead_val
         paths.append(("lead_gen", leads_monthly, 0, f"Lead-gen page for {niche} – sell leads @ ${lead_val}/lead"))
 
-    # ---- PATH E: AFFILIATE REDIRECT ----
     if niche in ["crypto", "fintech", "saas", "insurance"] and monthly_traffic > 20:
         aff_monthly = (monthly_traffic / 1000) * 15
         paths.append(("affiliate", aff_monthly, 0, f"Redirect to affiliate offer in {niche} niche"))
@@ -367,18 +362,14 @@ def detect_monetization_paths(domain, niche, age, backlinks, monthly_traffic, cc
     if not paths:
         paths.append(("hold_and_list", 0, flip_estimate or 50, "List for sale; low immediate opportunity"))
 
-    # Sort by monthly_est descending (primary scoring uses recurring income)
     paths.sort(key=lambda x: x[1], reverse=True)
     primary = paths[0]
     secondary = paths[1] if len(paths) > 1 else paths[0]
-
     return primary[0], secondary[0], primary[1], flip_estimate, primary[3]
 
 def monetization_score(monthly_est):
-    """Score based only on recurring monthly potential (not one‑time flip)."""
     if monthly_est <= 0:
         return 0
-    # Cap at 100 for $100+/mo
     return min(100, monthly_est)
 
 def build_affiliate_links(domain):
@@ -392,7 +383,6 @@ def build_affiliate_links(domain):
     links["afternic"] = f"https://www.afternic.com/domain/{domain}"
     return links
 
-# ========== SCORING FUNCTIONS ==========
 def foundation_score(backlinks, cc_hits, age, tld):
     bl_norm  = min(100, backlinks / 3)
     cc_norm  = min(100, cc_hits * 20)
@@ -410,7 +400,7 @@ def flip_score_fn(domain, niche_cpm, age, tld):
 def momentum_score(trend_pct):
     return max(0.0, min(100.0, 50.0 + trend_pct / 2.0))
 
-def process_domain(domain, source):
+def process_domain(domain, source, conn):
     tld = "." + domain.split(".")[-1]
     if TLD_VALUE.get(tld, DEFAULT_TLD) < 20:
         log.debug(f"Skip {domain}: low TLD {tld}")
@@ -435,7 +425,6 @@ def process_domain(domain, source):
     if not safe:
         hist_s = min(hist_s, 20)
 
-    # Auto‑blacklist heavy spam
     if spam_flags >= 3 and hist_s < 30:
         add_to_blacklist(conn, domain, f"spam flags={spam_flags}, history={hist_s}")
         return None
@@ -494,9 +483,9 @@ def process_domain(domain, source):
         "flip_range":          f"${flip_est*.8:.0f}–${flip_est*1.2:.0f}" if flip_est else "TBD",
     }
 
-# ========== OUTPUTS ==========
 def push_to_sheets(df):
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        log.warning("Google Sheets config missing – skipping export.")
         return
     try:
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
@@ -518,6 +507,7 @@ def push_to_sheets(df):
         log.info(f"Pushed {len(df)} rows to Google Sheets.")
     except Exception as e:
         log.error(f"Sheets push failed: {e}")
+        traceback.print_exc()
 
 def send_telegram(d):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -545,7 +535,7 @@ def send_telegram(d):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=10)
-        log.info(f"Telegram alert: {d['domain']}")
+        log.info(f"Telegram alert sent for {d['domain']}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -594,75 +584,92 @@ def send_email_digest(results):
 
 # ========== MAIN ==========
 def main():
-    global conn, CC_INDEX_URL
+    global CC_INDEX_URL
     log.info("=" * 65)
-    log.info("Domain Fortress Sniper PRO – Zero Investment Monetization (Enhanced)")
+    log.info("Domain Fortress Sniper PRO – Enhanced Error Logging")
     log.info("=" * 65)
-    conn = init_db()
 
-    # Refresh CommonCrawl index at start
-    CC_INDEX_URL = get_latest_cc_index()
-    log.info(f"Using CommonCrawl index: {CC_INDEX_URL}")
+    try:
+        conn = init_db()
+        log.info("Database initialized.")
 
-    all_domains = []
-    all_domains.extend(fetch_expireddomains(limit=80))
-    time.sleep(2)
-    all_domains.extend(fetch_dropcatch(limit=40))
-    time.sleep(2)
-    for kw in ["lawyer", "dental", "solar", "ai", "saas", "crypto", "insurance"]:
-        all_domains.extend(fetch_expireddomains_keyword(kw, limit=15))
-        time.sleep(1.5)
+        CC_INDEX_URL = get_latest_cc_index()
+        log.info(f"CommonCrawl index: {CC_INDEX_URL}")
 
-    seen_set = set()
-    unique = []
-    for d, src in all_domains:
-        if d not in seen_set and not is_seen(conn, d) and not is_blacklisted(conn, d):
-            seen_set.add(d)
-            unique.append((d, src))
-    log.info(f"New unique domains to process: {len(unique)}")
+        # Fetch domains
+        log.info("Fetching expireddomains.net...")
+        all_domains = fetch_expireddomains(limit=80)
+        time.sleep(2)
+        log.info("Fetching DropCatch...")
+        all_domains.extend(fetch_dropcatch(limit=40))
+        time.sleep(2)
+        for kw in ["lawyer", "dental", "solar", "ai", "saas", "crypto", "insurance"]:
+            log.info(f"Keyword search: {kw}")
+            all_domains.extend(fetch_expireddomains_keyword(kw, limit=15))
+            time.sleep(1.5)
 
-    results = []
-    for domain, src in unique:
-        log.info(f"  → {domain} ({src})")
-        try:
-            data = process_domain(domain, src)
-            if data:
-                results.append(data)
-                mark_seen(conn, domain, data["final_score"], data["primary_path"])
-        except Exception as e:
-            log.error(f"Error on {domain}: {e}")
-        time.sleep(1.2)
+        # Deduplicate and filter
+        seen_set = set()
+        unique = []
+        for d, src in all_domains:
+            if d not in seen_set and not is_seen(conn, d) and not is_blacklisted(conn, d):
+                seen_set.add(d)
+                unique.append((d, src))
+        log.info(f"New unique domains to process: {len(unique)}")
 
-    if not results:
-        log.warning("No domains scored today.")
+        if not unique:
+            log.warning("No new domains to process. Exiting.")
+            conn.close()
+            # Write empty CSV to avoid upload error? Actually we'll skip CSV.
+            return
+
+        results = []
+        for domain, src in unique:
+            log.info(f"Processing: {domain} ({src})")
+            try:
+                data = process_domain(domain, src, conn)
+                if data:
+                    results.append(data)
+                    mark_seen(conn, domain, data["final_score"], data["primary_path"])
+            except Exception as e:
+                log.error(f"Error processing {domain}: {e}")
+                traceback.print_exc()
+            time.sleep(1.2)
+
+        if not results:
+            log.warning("No domains scored. Exiting.")
+            conn.close()
+            return
+
+        df = pd.DataFrame(results).sort_values("final_score", ascending=False)
+        push_to_sheets(df)
+
+        csv_path = f"domains_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+        df.to_csv(csv_path, index=False)
+        log.info(f"Local CSV saved: {csv_path}")
+
+        pearls = df[df["final_score"] >= MIN_ALERT_SCORE]
+        log.info(f"Pearls (score >= {MIN_ALERT_SCORE}): {len(pearls)}")
+        for _, row in pearls.iterrows():
+            send_telegram(row.to_dict())
+            time.sleep(1)
+
+        send_email_digest(results)
+
+        log.info(f"\n{'='*50}")
+        log.info(f"SUMMARY")
+        log.info(f"  Domains processed : {len(results)}")
+        log.info(f"  Pearls found      : {len(pearls)}")
+        if not results.empty:
+            best = df.iloc[0]
+            log.info(f"  Best domain       : {best['domain']} (score {best['final_score']})")
+            log.info(f"  Best path         : {best['primary_path']} → {best['monetization_note']}")
         conn.close()
-        return
-
-    df = pd.DataFrame(results).sort_values("final_score", ascending=False)
-    push_to_sheets(df)
-
-    csv_path = f"domains_{datetime.utcnow().strftime('%Y%m%d')}.csv"
-    df.to_csv(csv_path, index=False)
-    log.info(f"Local CSV saved: {csv_path}")
-
-    pearls = df[df["final_score"] >= MIN_ALERT_SCORE]
-    log.info(f"Pearls (score >= {MIN_ALERT_SCORE}): {len(pearls)}")
-    for _, row in pearls.iterrows():
-        send_telegram(row.to_dict())
-        time.sleep(1)
-
-    send_email_digest(results)
-
-    log.info(f"\n{'='*50}")
-    log.info(f"SUMMARY")
-    log.info(f"  Domains processed : {len(results)}")
-    log.info(f"  Pearls found      : {len(pearls)}")
-    if not results.empty:
-        best = df.iloc[0]
-        log.info(f"  Best domain       : {best['domain']} (score {best['final_score']})")
-        log.info(f"  Best path         : {best['primary_path']} → {best['monetization_note']}")
-    conn.close()
-    log.info("Done.")
+        log.info("Done.")
+    except Exception as e:
+        log.error(f"FATAL error in main: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
