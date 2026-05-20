@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Domain Fortress Sniper – Institutional Quantitative Edition (Production Refined)
+Domain Fortress Sniper – Institutional Quantitative Edition (Optimized)
 """
 
 import os, sys, re, time, json, sqlite3, logging, smtplib
@@ -38,7 +38,7 @@ try:
 except ImportError:
     GSPREAD_OK = False
 
-# ---------- LOGGING SYSTEM ----------
+# ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
@@ -46,41 +46,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("DomainSniperInstitutional")
 
-# ---------- CONFIGURATION ENVIRONMENT MATRIX ----------
+# ---------- ENVIRONMENT ----------
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 GOOGLE_CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON", "")
 GOOGLE_SHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")
 SHEET_NAME         = os.getenv("SHEET_NAME", "DomainSniperHybrid")
-MIN_ALERT_SCORE    = int(os.getenv("MIN_ALERT_SCORE", "81"))
+MIN_ALERT_SCORE    = int(os.getenv("MIN_ALERT_SCORE", "85"))   # Raised to 85 for fewer alerts
 DB_PATH            = os.getenv("DB_PATH", "domain_sniper_institutional.db")
 MAX_WORKERS        = int(os.getenv("MAX_WORKERS", "5"))
 KELLY_BANKROLL     = float(os.getenv("KELLY_BANKROLL", "10000")) 
 ENABLE_TRADEMARK   = os.getenv("USPTO_SEARCH", "1") == "1"
 MAX_DOMAINS        = int(os.getenv("MAX_DOMAINS", "300"))
 
-# Affiliate Tracking ID Identifiers
 AFFILIATE_ID_GD    = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC    = os.getenv("AFFILIATE_ID_NC", "")
 
-# Reddit Developer Gateway App Access Credentials
 REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "DomainSniperInstitutional/1.0")
 
-# ---------- QUANTITATIVE ASSET CONSTANTS ----------
+# ---------- CONSTANTS ----------
 USD_TO_INR = float(os.getenv("EXCHANGE_RATE_INR", "83.50")) 
 
 TLD_VALUE = {".com": 100, ".io": 90, ".ai": 95, ".co": 75, ".net": 60, ".org": 65}
 DEFAULT_TLD = 20
 
 TLD_REG_COSTS = {
-    ".com": (12.0, "Standard Tier"),
-    ".net": (14.0, "Standard Tier"),
-    ".org": (15.0, "Standard Tier"),
-    ".io": (40.0, "Tech Premium Tier"),
-    ".ai": (80.0, "Macro AI Premium Tier"),
-    ".co": (25.0, "Mid-Range Tier")
+    ".com": (12.0, "Standard Tier"), ".net": (14.0, "Standard Tier"),
+    ".org": (15.0, "Standard Tier"), ".io": (40.0, "Tech Premium Tier"),
+    ".ai": (80.0, "Macro AI Premium Tier"), ".co": (25.0, "Mid-Range Tier")
 }
 DEFAULT_REG_COST = 15.0
 
@@ -96,10 +91,9 @@ NICHE_MAP = {
 NICHE_SCORE = {k: v["score"] for k, v in NICHE_MAP.items()}
 NICHE_CPC   = {k: v["cpc"]   for k, v in NICHE_MAP.items()}
 
-# Global runtime state tracking variable for dynamic CC indexes
 DYNAMIC_CC_URL = "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
 
-# ---------- STABLE DATABASE TRANSACTION STORAGE ----------
+# ---------- DATABASE ----------
 _DB_LOCK = threading.Lock()
 
 def init_db() -> sqlite3.Connection:
@@ -150,7 +144,7 @@ def put_cached(conn, table: str, key: str, data: Dict, ttl_hours: int = 6):
     placeholders = ",".join(["?"] * len(vals))
     db_write(conn, f"INSERT OR REPLACE INTO {table}(keyword,{','.join(cols)}) VALUES(?,{placeholders})", (key,) + tuple(vals))
 
-# ---------- ASSET INFRASTRUCTURE PROBING LAYER ----------
+# ---------- NETWORK HELPERS ----------
 def http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"}
     try:
@@ -160,7 +154,6 @@ def http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     return None
 
 def fetch_latest_commoncrawl_index():
-    """Observation Fix 1: Dynamically fetches the newest operational Common Crawl index map matrix"""
     global DYNAMIC_CC_URL
     url = "https://index.commoncrawl.org/collinfo.json"
     try:
@@ -171,10 +164,10 @@ def fetch_latest_commoncrawl_index():
                 latest_api = data[0].get("cdx-api")
                 if latest_api:
                     DYNAMIC_CC_URL = latest_api
-                    log.info(f"CommonCrawl Engine: Successfully shifted active index endpoint matrix to: {DYNAMIC_CC_URL}")
+                    log.info(f"CommonCrawl Engine: shifted to {DYNAMIC_CC_URL}")
                     return
     except Exception as e:
-        log.warning(f"CommonCrawl Engine Failover Warning: Could not harvest current directory token mapping: {e}. Defaulting to backup layout configuration baseline.")
+        log.warning(f"CommonCrawl index fetch failed: {e}")
 
 def fetch_wayback_backlinks(domain: str) -> int:
     resp = http_get(f"http://web.archive.org/cdx/search/cdx?url=*.{domain}&output=text&fl=urlkey&limit=400&collapse=urlkey")
@@ -198,11 +191,9 @@ def fetch_commoncrawl_presence(domain: str) -> int:
     if not resp or not resp.text: return 0
     return sum(1 for line in resp.text.strip().splitlines() if "url" in line)
 
-# ---------- INITIAL TESTING COMP DATA SEED ----------
 def seed_namebio_cache(conn):
     row = conn.execute("SELECT COUNT(1) FROM comps_cache").fetchone()
     if row and row[0] > 0: return 
-    
     url = "https://raw.githubusercontent.com/GeekatPlay/NameBio-Scraper/master/sample_sales.csv"
     resp = http_get(url)
     if resp and resp.text:
@@ -218,7 +209,7 @@ def seed_namebio_cache(conn):
             conn.commit()
         except Exception: pass
 
-# ---------- DYNAMIC RADAR ENGINE ----------
+# ---------- TREND RADAR ----------
 class DynamicTrendRadar:
     STOP_WORDS = {"the","and","for","this","that","with","from","are","has","was","its","via","news","about"}
 
@@ -239,7 +230,6 @@ class DynamicTrendRadar:
     def _fetch_reddit_trends_free(self) -> Counter:
         c = Counter()
         subs = ["technology", "artificial", "SaaS", "investing", "quantum", "biotech"]
-        
         if PRAW_OK and REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
             try:
                 reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
@@ -249,7 +239,6 @@ class DynamicTrendRadar:
                             if token not in self.STOP_WORDS: c[token] += 1
                 return c
             except Exception: pass
-
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
         for sname in subs[:4]:
             try:
@@ -262,18 +251,17 @@ class DynamicTrendRadar:
             except Exception: pass
         return c
 
-    def execute_radar_scan(self, top_n: int = 25) -> List[Dict]:
+    def execute_radar_scan(self, top_n: int = 10) -> List[Dict]:
         log.info("DynamicTrendRadar: Processing multi-channel narrative clusters...")
         combined = self._fetch_hn_algolia_trends() + self._fetch_reddit_trends_free()
         extracted_keywords = [k for k, _ in combined.most_common(top_n)]
-        
         output = []
         for kw in extracted_keywords:
             output.append({"keyword": kw, "combined_signal": combined[kw], "trend_pct": 25.0, "velocity": 1.5})
             put_cached(self.conn, "trend_cache", kw, {"trend_pct": 25.0, "velocity": 1.5})
         return output
 
-# ---------- INSTITUTIONAL SENTIMENT ANALYSIS LAYER ----------
+# ---------- SENTIMENT ----------
 class InstitutionalSentimentEngine:
     def __init__(self, conn):
         self.conn = conn
@@ -290,22 +278,19 @@ class InstitutionalSentimentEngine:
     def analyze_asset_sentiment(self, keyword: str) -> Dict:
         cached = get_cached(self.conn, "sentiment_cache", keyword)
         if cached: return cached
-        
         headlines = self._get_news_stream_headlines(keyword)
         if not headlines or not self.vader:
             payload = {"compound": 0.0, "headline_count": 0, "sentiment_score": 50.0}
             put_cached(self.conn, "sentiment_cache", keyword, payload, ttl_hours=4)
             return payload
-            
         scores = [self.vader.polarity_scores(text)["compound"] for text in headlines]
         avg_compound = sum(scores) / len(scores)
         sentiment_score = round(50.0 + (avg_compound * 50.0), 1)
-        
         payload = {"compound": round(avg_compound, 4), "headline_count": len(headlines), "sentiment_score": sentiment_score}
         put_cached(self.conn, "sentiment_cache", keyword, payload, ttl_hours=4)
         return payload
 
-# ---------- OFFICIAL USPTO SEARCH GATEWAY ----------
+# ---------- USPTO ----------
 class TrademarkGuard:
     @staticmethod
     def check(domain: str) -> Dict:
@@ -322,7 +307,7 @@ class TrademarkGuard:
         except Exception: pass
         return {"risk": "CLEAR", "matches": 0}
 
-# ---------- ARBITRAGE SEO INTELLIGENCE ENGINE ----------
+# ---------- SEO ----------
 class SEOIntelligence:
     def __init__(self, conn): self.conn = conn
 
@@ -331,42 +316,35 @@ class SEOIntelligence:
         keyword = sld.replace("-", " ")
         cached = get_cached(self.conn, "seo_cache", keyword)
         if cached: return cached
-        
         serp_elasticity = round(100.0 - min(100.0, (cc_hits * 5.0) + (backlinks * 0.5)), 1)
         tld_trust = {".com": 1.0, ".ai": 0.88, ".io": 0.85}.get(tld, 0.60)
         eeat_score = round((min(100.0, age * 8.0) * 0.45) + (min(100.0, backlinks * 2.0) * 0.35) + (tld_trust * 20.0), 1)
-        
         cpc_value = NICHE_CPC.get(niche, 0.50)
         seo_score = round((min(100.0, cpc_value * 1.8) * 0.3) + (eeat_score * 0.4) + (serp_elasticity * 0.3), 1)
-        
         payload = {"cpc": cpc_value, "search_vol_proxy": 50.0, "serp_competition": serp_elasticity, "intent_class": "commercial", "seo_score": seo_score}
         put_cached(self.conn, "seo_cache", keyword, payload, ttl_hours=24)
         return payload
 
-# ---------- NATIVE CONNECTIONS LAYER ----------
+# ---------- WHOIS ----------
 def port43_whois_audit(domain: str) -> Tuple[bool, int]:
     tld = domain.split(".")[-1].lower()
     server_map = {"com": "whois.verisign-grs.com", "net": "whois.verisign-grs.com", "io": "whois.nic.io", "co": "whois.nic.co", "ai": "whois.nic.ai"}
     whois_server = server_map.get(tld, "whois.iana.org")
-    
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(5.0)
     try:
         s.connect((whois_server, 43))
         query = f"domain {domain}\r\n" if tld in ("com", "net") else f"{domain}\r\n"
         s.send(query.encode())
-        
         response = b""
         while True:
             data = s.recv(4096)
             if not data: break
             response += data
         s.close()
-        
         raw = response.decode('utf-8', errors='ignore')
         if any(p in raw for p in ["No match for", "NOT FOUND", "Not Registered", "No Data Found"]):
             return True, 0
-            
         age_match = re.search(r"(?:Creation Date|created):\s*([^\s]+)", raw, re.I)
         if age_match:
             date_str = age_match.group(1)[:10]
@@ -375,7 +353,7 @@ def port43_whois_audit(domain: str) -> Tuple[bool, int]:
     except Exception: pass
     return False, 0
 
-# ---------- RISK MODELLING & STOCHASTIC FORECASTING ----------
+# ---------- PROBABILITY ----------
 class ProbabilityEngine:
     @staticmethod
     def sigmoid(x: float) -> float:
@@ -387,7 +365,6 @@ class ProbabilityEngine:
         return round(min(0.97, max(0.01, self.sigmoid(z))), 4)
 
     def monte_carlo_flip_value(self, base_estimate: float, niche: str) -> Dict:
-        """Observation Fix 2: Explicit failover handles out-of-bounds metrics smoothly without crashing loops"""
         clamped_estimate = max(15.0, base_estimate)
         sigma = 0.60
         mu = math.log(clamped_estimate) - 0.5 * (sigma ** 2)
@@ -409,7 +386,7 @@ def fetch_local_namebio_median(conn, keyword: str) -> float:
     row = conn.execute("SELECT median_sale FROM comps_cache WHERE keyword=?", (keyword.lower(),)).fetchone()
     return float(row[0]) if row else 0.0
 
-# ---------- SPREADSHEETS EXPORT EXECUTOR ----------
+# ---------- SHEETS & TELEGRAM ----------
 def push_to_sheets(df: pd.DataFrame):
     if not GSPREAD_OK or not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID: return
     try:
@@ -420,13 +397,12 @@ def push_to_sheets(df: pd.DataFrame):
         vals = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
         ws.clear()
         ws.update(vals, value_input_option="RAW")
-        log.info(f"Google Sheets Export: Flushed {len(df)} entries cleanly into unified core dashboard.")
-    except Exception as e: log.error(f"Google Sheets Integration Module Error: {e}")
+        log.info(f"Google Sheets: {len(df)} rows")
+    except Exception as e: log.error(f"Sheets error: {e}")
 
 def send_telegram(d: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     se = "🟢" if d["sentiment_compound"] > 0.1 else "🔴" if d["sentiment_compound"] < -0.1 else "⚪"
-    
     msg = (f"🏆 *PEARL FOUND* {d['final_score']}/100\n"
            f"🌐 *{d['domain']}*\n"
            f"💰 *Est. Registration:* ${d['reg_cost_usd']:.2f} (~₹{d['reg_cost_inr']:,.2f} INR)\n"
@@ -436,54 +412,60 @@ def send_telegram(d: Dict):
            f"{se} Sentiment Score: {d['sentiment_score']:.0f}\n"
            f"📊 P(flip): {d['p_flip_success']:.0%} │ MC Range: {d['mc_range_str']}\n"
            f"💰 *Kelly Allocation Target:* ${d['kelly_alloc_usd']:,.2f} (~₹{d['kelly_alloc_inr']:,.0f} INR)\n"
-           f"📥 [Sedo Marketplace Brokerage Link]({d['link_sedo']})")
-           
+           f"📥 [Sedo]({d['link_sedo']})")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=8)
-    except Exception as e: log.error(f"Telegram dispatcher block exception: {e}")
+    except Exception as e: log.error(f"Telegram error: {e}")
 
-# ---------- SCORING COMPILATION PIPELINE LAYER ----------
+# ---------- PROCESS DOMAIN (with cheap pre‑filters) ----------
 def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: InstitutionalSentimentEngine, tm: TrademarkGuard) -> Optional[Dict]:
     log.info(f"⏳ [START] Processing domain: {domain} (Source: {source})")
+    
+    # Cheap pre‑filter: reject domains with more than one hyphen or consecutive hyphens
+    sld = domain.split(".")[0].lower()
+    if sld.count("-") > 1 or "--" in sld:
+        log.debug(f"Skip {domain}: too many hyphens")
+        return None
+    # Reject domains longer than 12 characters (excluding TLD)
+    if len(sld) > 12:
+        log.debug(f"Skip {domain}: SLD too long ({len(sld)} chars)")
+        return None
+    # Reject domains that are purely alphanumeric but have no vowel (unpronounceable)
+    if re.fullmatch(r"[a-z]+", sld) and not re.search(r"[aeiou]", sld):
+        log.debug(f"Skip {domain}: no vowels, unpronounceable")
+        return None
     
     is_available, age = port43_whois_audit(domain)
     tld = "." + domain.split(".")[-1].lower()
     
-    log.info(f"🔍 [{domain}] WHOIS Registry Result │ Available: {is_available} │ Parsed Age: {age} years")
+    log.info(f"🔍 [{domain}] WHOIS │ Available: {is_available} │ Age: {age} years")
     
-    sld = domain.split(".")[0].lower()
     dl_clean = sld.replace("-", "")
     niche = next((k for k in NICHE_SCORE if k in dl_clean), "general")
     
     tm_data = tm.check(domain)
-    log.info(f"🛡️ [{domain}] Trademark Protection Query │ Risk: {tm_data.get('risk')} │ Conflict Matches: {tm_data.get('matches', 0)}")
+    log.info(f"🛡️ [{domain}] Trademark │ Risk: {tm_data.get('risk')} │ Matches: {tm_data.get('matches', 0)}")
     if tm_data["risk"] == "RISK":
-        log.warning(f"❌ [SKIP] {domain} eliminated due to active USPTO trademark conflict.")
+        log.warning(f"❌ [SKIP] {domain} trademark conflict.")
         return None
     
-    # Circuit Breakers Matrix: Fallback vectors protect evaluation structures from network dropouts
-    log.info(f"📡 [{domain}] Extracting active public metrics footprints from web archives...")
+    log.info(f"📡 [{domain}] Fetching footprints...")
     try: bl = fetch_wayback_backlinks(domain)
-    except Exception: bl = 3; log.debug(f"Wayback backlink query circuit breaker tripped for {domain}. Injecting baseline distribution matrix.")
-    
+    except Exception: bl = 3
     try: snaps = fetch_wayback_snapshots(domain)
     except Exception: snaps = 10
-    
     try: cc = fetch_commoncrawl_presence(domain)
     except Exception: cc = 1
     
-    log.info(f"📊 [{domain}] Footprint Matrix │ Backlinks: {bl} │ Snapshots: {snaps} │ CommonCrawl Hits: {cc}")
+    log.info(f"📊 [{domain}] Backlinks: {bl} │ Snapshots: {snaps} │ CC: {cc}")
     
-    log.info(f"🎭 [{domain}] Scraping alternative news clusters for sentiment indexing...")
     sent_data = sent.analyze_asset_sentiment(sld)
-    log.info(f"💬 [{domain}] Sentiment Matrix │ Polarity Compound: {sent_data['compound']:+.4f} │ Score: {sent_data['sentiment_score']:.1f}")
+    log.info(f"💬 [{domain}] Sentiment: {sent_data['sentiment_score']:.1f}")
     
     seo_data = seo.evaluate_arbitrage(domain, niche, age, bl, cc, tld)
-    log.info(f"📈 [{domain}] SEO Arbitrage Matrix │ Niche: {niche.upper()} │ Computed SEO Score: {seo_data['seo_score']:.1f}")
-    
     comp_median = fetch_local_namebio_median(conn, sld)
     if comp_median > 0:
-        log.info(f"💰 [{domain}] Local NameBio Ledger Match │ Historical Median Comp Sale: ${comp_median:,.0f}")
+        log.info(f"💰 [{domain}] NameBio comp: ${comp_median:,.0f}")
     
     found_score = min(100.0, (bl / 3.0) * 32.0 + (cc * 20.0) * 26.0 + (age * 5.0) * 24.0)
     brand_score = 85.0 if len(sld) <= 7 and "-" not in sld else 40.0
@@ -491,7 +473,7 @@ def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: I
     final_score = int((found_score * 0.25) + (brand_score * 0.25) + (sent_data["sentiment_score"] * 0.3) + (TLD_VALUE.get(tld, 20) * 0.2))
     
     if final_score < 40:
-        log.warning(f"⚠️ [SKIP] {domain} dropped. Final Composite Score ({final_score}) sits below alpha threshold floor (40).")
+        log.warning(f"⚠️ [SKIP] {domain} final score {final_score} < 40")
         return None
         
     prob_engine = ProbabilityEngine()
@@ -499,24 +481,20 @@ def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: I
     mc_data = prob_engine.monte_carlo_flip_value(max(comp_median, snaps * 12.0, age * 75.0), niche)
     k_data = prob_engine.kelly_allocation(p_win, mc_data["p50"])
     
-    # Calculate Registration and Conversion Metrics (USD & INR)
     reg_cost_usd = TLD_REG_COSTS.get(tld, (DEFAULT_REG_COST, "Standard"))[0]
     reg_cost_inr = reg_cost_usd * USD_TO_INR
     kelly_alloc_usd = k_data["allocation_usd"]
     kelly_alloc_inr = kelly_alloc_usd * USD_TO_INR
     
-    # Format Currency Metric Strings Dynamically
     mc_range_str = f"${mc_data['p10']:,.0f}–${mc_data['p90']:,.0f} (₹{mc_data['p10']*USD_TO_INR:,.0f}–₹{mc_data['p90']*USD_TO_INR:,.0f} INR)"
     
-    # Build Production Affiliate/Direct Gateway Hyperlink Strings
     gd_aff = f"&isc={AFFILIATE_ID_GD}" if AFFILIATE_ID_GD else ""
     nc_aff = f"&AffiliateCode={AFFILIATE_ID_NC}" if AFFILIATE_ID_NC else ""
-    
     link_godaddy = f"https://www.godaddy.com/domainsearch/find?domainToCheck={domain}{gd_aff}"
     link_namecheap = f"https://www.namecheap.com/domains/registration/results/?domain={domain}{nc_aff}"
     link_name = f"https://www.name.com/domain/search/{domain}"
     
-    log.info(f"🏁 [SUCCESS] Scored Asset Allocation Calculated for {domain} │ Total Score: {final_score} │ P(Win): {p_win:.1%} │ Kelly: {k_data['verdict']}")
+    log.info(f"🏁 [SUCCESS] {domain} │ Score: {final_score} │ P(Win): {p_win:.1%} │ Kelly: {k_data['verdict']}")
     
     return {
         "domain": domain, "source": source, "final_score": final_score, "niche": niche,
@@ -530,9 +508,9 @@ def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: I
 
 class QuantumCombinatoricsEngine:
     AFFIXES = ["get", "buy", "ai", "lab", "hub", "pro"]
-    def generate(self, trend_list: List[str], top_n: int = 100) -> List[Tuple[str, str]]:
+    def generate(self, trend_list: List[str], top_n: int = 30) -> List[Tuple[str, str]]:
         out = []
-        for kw in trend_list[:20]:
+        for kw in trend_list[:15]:
             for affix in self.AFFIXES:
                 for tld in [".com", ".ai", ".io"]:
                     out.append((f"{affix}{kw}{tld}", "combinatorics"))
@@ -540,12 +518,11 @@ class QuantumCombinatoricsEngine:
         random.shuffle(out)
         return out[:top_n]
 
-# ---------- MAIN DEPLOYMENT PIPELINE RUNNER ----------
+# ---------- MAIN ----------
 def main():
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     log.info(f"Initiating High-Alpha Core Run Execution: {run_id}")
     
-    # Resolve dynamic indexing endpoints before spinning worker threads
     fetch_latest_commoncrawl_index()
     
     conn = init_db()
@@ -556,12 +533,12 @@ def main():
     tm_guard = TrademarkGuard()
     
     radar = DynamicTrendRadar(conn)
-    live_trends = radar.execute_radar_scan(top_n=15)
+    live_trends = radar.execute_radar_scan(top_n=10)   # Only 10 trending keywords
     harvested_keywords = [item["keyword"] for item in live_trends]
     log.info(f"Dynamic Trend Matrix Extracted Keywords: {harvested_keywords[:6]}")
     
     quantum = QuantumCombinatoricsEngine()
-    pool = quantum.generate(harvested_keywords, top_n=60)
+    pool = quantum.generate(harvested_keywords, top_n=30)   # Only 30 candidate domains
     
     results = []
     seen = set()
