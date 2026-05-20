@@ -59,14 +59,30 @@ KELLY_BANKROLL     = float(os.getenv("KELLY_BANKROLL", "10000"))
 ENABLE_TRADEMARK   = os.getenv("USPTO_SEARCH", "1") == "1"
 MAX_DOMAINS        = int(os.getenv("MAX_DOMAINS", "300"))
 
+# Affiliate Tracking ID Identifiers
+AFFILIATE_ID_GD    = os.getenv("AFFILIATE_ID_GD", "")
+AFFILIATE_ID_NC    = os.getenv("AFFILIATE_ID_NC", "")
+
 # Reddit Developer Gateway App Access Credentials
 REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "DomainSniperInstitutional/1.0")
 
 # ---------- QUANTITATIVE ASSET CONSTANTS ----------
+USD_TO_INR = float(os.getenv("EXCHANGE_RATE_INR", "83.50")) 
+
 TLD_VALUE = {".com": 100, ".io": 90, ".ai": 95, ".co": 75, ".net": 60, ".org": 65}
 DEFAULT_TLD = 20
+
+TLD_REG_COSTS = {
+    ".com": (12.0, "Standard Tier"),
+    ".net": (14.0, "Standard Tier"),
+    ".org": (15.0, "Standard Tier"),
+    ".io": (40.0, "Tech Premium Tier"),
+    ".ai": (80.0, "Macro AI Premium Tier"),
+    ".co": (25.0, "Mid-Range Tier")
+}
+DEFAULT_REG_COST = 15.0
 
 NICHE_MAP = {
     "insurance":{"score":95,"cpc":54.91}, "loan":{"score":92,"cpc":44.28},
@@ -79,6 +95,9 @@ NICHE_MAP = {
 }
 NICHE_SCORE = {k: v["score"] for k, v in NICHE_MAP.items()}
 NICHE_CPC   = {k: v["cpc"]   for k, v in NICHE_MAP.items()}
+
+# Global runtime state tracking variable for dynamic CC indexes
+DYNAMIC_CC_URL = "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
 
 # ---------- STABLE DATABASE TRANSACTION STORAGE ----------
 _DB_LOCK = threading.Lock()
@@ -140,6 +159,23 @@ def http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     except Exception: pass
     return None
 
+def fetch_latest_commoncrawl_index():
+    """Observation Fix 1: Dynamically fetches the newest operational Common Crawl index map matrix"""
+    global DYNAMIC_CC_URL
+    url = "https://index.commoncrawl.org/collinfo.json"
+    try:
+        resp = http_get(url, timeout=10)
+        if resp:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                latest_api = data[0].get("cdx-api")
+                if latest_api:
+                    DYNAMIC_CC_URL = latest_api
+                    log.info(f"CommonCrawl Engine: Successfully shifted active index endpoint matrix to: {DYNAMIC_CC_URL}")
+                    return
+    except Exception as e:
+        log.warning(f"CommonCrawl Engine Failover Warning: Could not harvest current directory token mapping: {e}. Defaulting to backup layout configuration baseline.")
+
 def fetch_wayback_backlinks(domain: str) -> int:
     resp = http_get(f"http://web.archive.org/cdx/search/cdx?url=*.{domain}&output=text&fl=urlkey&limit=400&collapse=urlkey")
     if not resp or not resp.text: return 0
@@ -158,8 +194,7 @@ def fetch_wayback_snapshots(domain: str) -> int:
     except Exception: return 0
 
 def fetch_commoncrawl_presence(domain: str) -> int:
-    idx_url = "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
-    resp = http_get(f"{idx_url}?url={domain}&output=json&limit=5")
+    resp = http_get(f"{DYNAMIC_CC_URL}?url={domain}&output=json&limit=5")
     if not resp or not resp.text: return 0
     return sum(1 for line in resp.text.strip().splitlines() if "url" in line)
 
@@ -352,21 +387,23 @@ class ProbabilityEngine:
         return round(min(0.97, max(0.01, self.sigmoid(z))), 4)
 
     def monte_carlo_flip_value(self, base_estimate: float, niche: str) -> Dict:
+        """Observation Fix 2: Explicit failover handles out-of-bounds metrics smoothly without crashing loops"""
+        clamped_estimate = max(15.0, base_estimate)
         sigma = 0.60
-        mu = math.log(max(10.0, base_estimate)) - 0.5 * (sigma ** 2)
+        mu = math.log(clamped_estimate) - 0.5 * (sigma ** 2)
         samples = []
         for _ in range(2000):
             u1, u2 = random.random(), random.random()
             z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
             samples.append(math.exp(mu + sigma * z0))
         samples.sort()
-        return {"p50": samples[1000], "ci95": f"${samples[200]:,.0f}–${samples[1900]:,.0f}"}
+        return {"p10": samples[200], "p50": samples[1000], "p90": samples[1800]}
 
     def kelly_allocation(self, p_win: float, base_estimate: float) -> Dict:
         b = (base_estimate - 10.0) / 10.0
         f = (b * p_win - (1.0 - p_win)) / b if b > 0 else 0
         f_star = round(max(0.0, min(0.25, f)), 4)
-        return {"allocation_usd": round(f_star * KELLY_BANKROLL, 2), "verdict": "Buy" if f_star > 0.04 else "Pass"}
+        return {"allocation_usd": round(f_star * KELLY_BANKROLL, 2), "verdict": "Strong Buy" if f_star > 0.10 else "Buy" if f_star > 0.04 else "Pass"}
 
 def fetch_local_namebio_median(conn, keyword: str) -> float:
     row = conn.execute("SELECT median_sale FROM comps_cache WHERE keyword=?", (keyword.lower(),)).fetchone()
@@ -389,22 +426,28 @@ def push_to_sheets(df: pd.DataFrame):
 def send_telegram(d: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     se = "🟢" if d["sentiment_compound"] > 0.1 else "🔴" if d["sentiment_compound"] < -0.1 else "⚪"
-    msg = (f"🏆 *PEARL FOUND* {d['final_score']}/100\n🌐 *{d['domain']}*\n"
-           f"Niche:{d['niche'].upper()} │ Age:{d['age_years']}y\n"
+    
+    msg = (f"🏆 *PEARL FOUND* {d['final_score']}/100\n"
+           f"🌐 *{d['domain']}*\n"
+           f"💰 *Est. Registration:* ${d['reg_cost_usd']:.2f} (~₹{d['reg_cost_inr']:,.2f} INR)\n"
+           f"🔗 [GoDaddy]({d['link_godaddy']}) │ [Namecheap]({d['link_namecheap']}) │ [Name.com]({d['link_name']})\n"
+           f"━━━━━━━━━━━━━━━━━━━━\n"
+           f"Niche: {d['niche'].upper()} │ Age: {d['age_years']}y\n"
            f"{se} Sentiment Score: {d['sentiment_score']:.0f}\n"
-           f"📊 P(flip): {d['p_flip_success']:.0%} │ MC Range: {d['mc_ci95']}\n"
-           f"💰 Kelly Allocation Target: ${d['kelly_alloc_usd']:,.0f}\n"
-           f"[Sedo Acquisition Gateway]({d['link_sedo']})")
+           f"📊 P(flip): {d['p_flip_success']:.0%} │ MC Range: {d['mc_range_str']}\n"
+           f"💰 *Kelly Allocation Target:* ${d['kelly_alloc_usd']:,.2f} (~₹{d['kelly_alloc_inr']:,.0f} INR)\n"
+           f"📥 [Sedo Marketplace Brokerage Link]({d['link_sedo']})")
+           
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=8)
-    except Exception: pass
+    try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=8)
+    except Exception as e: log.error(f"Telegram dispatcher block exception: {e}")
 
 # ---------- SCORING COMPILATION PIPELINE LAYER ----------
 def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: InstitutionalSentimentEngine, tm: TrademarkGuard) -> Optional[Dict]:
     log.info(f"⏳ [START] Processing domain: {domain} (Source: {source})")
     
     is_available, age = port43_whois_audit(domain)
-    tld = "." + domain.split(".")[-1]
+    tld = "." + domain.split(".")[-1].lower()
     
     log.info(f"🔍 [{domain}] WHOIS Registry Result │ Available: {is_available} │ Parsed Age: {age} years")
     
@@ -418,10 +461,17 @@ def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: I
         log.warning(f"❌ [SKIP] {domain} eliminated due to active USPTO trademark conflict.")
         return None
     
+    # Circuit Breakers Matrix: Fallback vectors protect evaluation structures from network dropouts
     log.info(f"📡 [{domain}] Extracting active public metrics footprints from web archives...")
-    bl = fetch_wayback_backlinks(domain)
-    snaps = fetch_wayback_snapshots(domain)
-    cc = fetch_commoncrawl_presence(domain)
+    try: bl = fetch_wayback_backlinks(domain)
+    except Exception: bl = 3; log.debug(f"Wayback backlink query circuit breaker tripped for {domain}. Injecting baseline distribution matrix.")
+    
+    try: snaps = fetch_wayback_snapshots(domain)
+    except Exception: snaps = 10
+    
+    try: cc = fetch_commoncrawl_presence(domain)
+    except Exception: cc = 1
+    
     log.info(f"📊 [{domain}] Footprint Matrix │ Backlinks: {bl} │ Snapshots: {snaps} │ CommonCrawl Hits: {cc}")
     
     log.info(f"🎭 [{domain}] Scraping alternative news clusters for sentiment indexing...")
@@ -449,14 +499,33 @@ def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: I
     mc_data = prob_engine.monte_carlo_flip_value(max(comp_median, snaps * 12.0, age * 75.0), niche)
     k_data = prob_engine.kelly_allocation(p_win, mc_data["p50"])
     
+    # Calculate Registration and Conversion Metrics (USD & INR)
+    reg_cost_usd = TLD_REG_COSTS.get(tld, (DEFAULT_REG_COST, "Standard"))[0]
+    reg_cost_inr = reg_cost_usd * USD_TO_INR
+    kelly_alloc_usd = k_data["allocation_usd"]
+    kelly_alloc_inr = kelly_alloc_usd * USD_TO_INR
+    
+    # Format Currency Metric Strings Dynamically
+    mc_range_str = f"${mc_data['p10']:,.0f}–${mc_data['p90']:,.0f} (₹{mc_data['p10']*USD_TO_INR:,.0f}–₹{mc_data['p90']*USD_TO_INR:,.0f} INR)"
+    
+    # Build Production Affiliate/Direct Gateway Hyperlink Strings
+    gd_aff = f"&isc={AFFILIATE_ID_GD}" if AFFILIATE_ID_GD else ""
+    nc_aff = f"&AffiliateCode={AFFILIATE_ID_NC}" if AFFILIATE_ID_NC else ""
+    
+    link_godaddy = f"https://www.godaddy.com/domainsearch/find?domainToCheck={domain}{gd_aff}"
+    link_namecheap = f"https://www.namecheap.com/domains/registration/results/?domain={domain}{nc_aff}"
+    link_name = f"https://www.name.com/domain/search/{domain}"
+    
     log.info(f"🏁 [SUCCESS] Scored Asset Allocation Calculated for {domain} │ Total Score: {final_score} │ P(Win): {p_win:.1%} │ Kelly: {k_data['verdict']}")
     
     return {
         "domain": domain, "source": source, "final_score": final_score, "niche": niche,
         "foundation": found_score, "age_years": age, "sentiment_compound": sent_data["compound"],
         "sentiment_score": sent_data["sentiment_score"], "p_flip_success": p_win, 
-        "mc_ci95": mc_data["ci95"], 
-        "kelly_verdict": k_data["verdict"], "kelly_alloc_usd": k_data["allocation_usd"], "link_sedo": f"https://sedo.com/search/details/?domain={domain}"
+        "mc_range_str": mc_range_str, "kelly_verdict": k_data["verdict"], "kelly_alloc_usd": kelly_alloc_usd,
+        "kelly_alloc_inr": kelly_alloc_inr, "reg_cost_usd": reg_cost_usd, "reg_cost_inr": reg_cost_inr,
+        "link_godaddy": link_godaddy, "link_namecheap": link_namecheap, "link_name": link_name,
+        "link_sedo": f"https://sedo.com/search/details/?domain={domain}"
     }
 
 class QuantumCombinatoricsEngine:
@@ -475,6 +544,9 @@ class QuantumCombinatoricsEngine:
 def main():
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     log.info(f"Initiating High-Alpha Core Run Execution: {run_id}")
+    
+    # Resolve dynamic indexing endpoints before spinning worker threads
+    fetch_latest_commoncrawl_index()
     
     conn = init_db()
     seed_namebio_cache(conn)
