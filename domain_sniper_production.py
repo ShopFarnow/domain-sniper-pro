@@ -52,9 +52,9 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 GOOGLE_CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON", "")
 GOOGLE_SHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")
 SHEET_NAME         = os.getenv("SHEET_NAME", "DomainSniperHybrid")
-MIN_ALERT_SCORE    = int(os.getenv("MIN_ALERT_SCORE", "80"))
+MIN_ALERT_SCORE    = int(os.getenv("MIN_ALERT_SCORE", "81"))
 DB_PATH            = os.getenv("DB_PATH", "domain_sniper_institutional.db")
-MAX_WORKERS        = int(os.getenv("MAX_WORKERS", "4"))
+MAX_WORKERS        = int(os.getenv("MAX_WORKERS", "5"))
 KELLY_BANKROLL     = float(os.getenv("KELLY_BANKROLL", "10000")) 
 ENABLE_TRADEMARK   = os.getenv("USPTO_SEARCH", "1") == "1"
 MAX_DOMAINS        = int(os.getenv("MAX_DOMAINS", "300"))
@@ -556,12 +556,12 @@ def main():
     tm_guard = TrademarkGuard()
     
     radar = DynamicTrendRadar(conn)
-    live_trends = radar.execute_radar_scan(top_n=20)
+    live_trends = radar.execute_radar_scan(top_n=15)
     harvested_keywords = [item["keyword"] for item in live_trends]
     log.info(f"Dynamic Trend Matrix Extracted Keywords: {harvested_keywords[:6]}")
     
     quantum = QuantumCombinatoricsEngine()
-    pool = quantum.generate(harvested_keywords, top_n=100)
+    pool = quantum.generate(harvested_keywords, top_n=60)
     
     results = []
     seen = set()
