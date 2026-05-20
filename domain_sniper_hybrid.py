@@ -146,7 +146,7 @@ REDDIT_SUBS = [
 
 # ---------- HTTP LAYER with timeout and retry (unchanged) ----------
 def http_get(url: str, timeout: int = 20, retries: int = 3,
-             backoff: float = 2.0, json_resp: bool = False,
+             backoff: float = 3.0, json_resp: bool = False,
              extra_headers: Optional[Dict] = None) -> Any:
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     if extra_headers:
@@ -1164,7 +1164,10 @@ def main():
     results = []
     args = [(d,s,conn,seo_engine,sent_engine,comps_engine,tm_guard) for d,s in unique]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_domain_safe, a):a[0] for a in args}
+        futures = {}
+for a in args:
+    futures[ex.submit(process_domain_safe, a)] = a[0]
+    time.sleep(0.5)   # stagger the start of each domain
         for fut in concurrent.futures.as_completed(futures):
             dname = futures[fut]
             try:
