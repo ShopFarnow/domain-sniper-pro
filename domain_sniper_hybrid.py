@@ -65,7 +65,7 @@ GMAIL_APP_PASS    = os.getenv("GMAIL_APP_PASS", "")
 AFFILIATE_ID_GD   = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC   = os.getenv("AFFILIATE_ID_NC", "")
 DB_PATH           = os.getenv("DB_PATH", "domain_sniper_hybrid.db")
-MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "4"))
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "2"))
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")
 KELLY_BANKROLL    = float(os.getenv("KELLY_BANKROLL", "10000"))
 ENABLE_TRADEMARK  = os.getenv("USPTO_SEARCH", "0") == "1"
