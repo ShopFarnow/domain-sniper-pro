@@ -165,9 +165,8 @@ def fetch_commoncrawl_presence(domain: str) -> int:
 
 # ---------- INITIAL TESTING COMP DATA SEED ----------
 def seed_namebio_cache(conn):
-    """Fallback Seed Dataset (Team Note: Useful for cold start, overridden by weekly action)"""
     row = conn.execute("SELECT COUNT(1) FROM comps_cache").fetchone()
-    if row and row[0] > 0: return # Already contains data records
+    if row and row[0] > 0: return 
     
     url = "https://raw.githubusercontent.com/GeekatPlay/NameBio-Scraper/master/sample_sales.csv"
     resp = http_get(url)
@@ -206,7 +205,6 @@ class DynamicTrendRadar:
         c = Counter()
         subs = ["technology", "artificial", "SaaS", "investing", "quantum", "biotech"]
         
-        # PRAW OAuth Secure Channel Ingestion Flow
         if PRAW_OK and REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
             try:
                 reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
@@ -217,7 +215,6 @@ class DynamicTrendRadar:
                 return c
             except Exception: pass
 
-        # Robust Tokenless Alternative Flow (Observation #5 Confirmed Validated)
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
         for sname in subs[:4]:
             try:
@@ -375,7 +372,7 @@ def fetch_local_namebio_median(conn, keyword: str) -> float:
     row = conn.execute("SELECT median_sale FROM comps_cache WHERE keyword=?", (keyword.lower(),)).fetchone()
     return float(row[0]) if row else 0.0
 
-# ---------- CORE PORTFOLIO MATRICES GENERATION LAYER ----------
+# ---------- SPREADSHEETS EXPORT EXECUTOR ----------
 def push_to_sheets(df: pd.DataFrame):
     if not GSPREAD_OK or not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID: return
     try:
@@ -404,40 +401,61 @@ def send_telegram(d: Dict):
 
 # ---------- SCORING COMPILATION PIPELINE LAYER ----------
 def process_domain(domain: str, source: str, conn, seo: SEOIntelligence, sent: InstitutionalSentimentEngine, tm: TrademarkGuard) -> Optional[Dict]:
+    log.info(f"⏳ [START] Processing domain: {domain} (Source: {source})")
+    
     is_available, age = port43_whois_audit(domain)
     tld = "." + domain.split(".")[-1]
+    
+    log.info(f"🔍 [{domain}] WHOIS Registry Result │ Available: {is_available} │ Parsed Age: {age} years")
     
     sld = domain.split(".")[0].lower()
     dl_clean = sld.replace("-", "")
     niche = next((k for k in NICHE_SCORE if k in dl_clean), "general")
     
     tm_data = tm.check(domain)
-    if tm_data["risk"] == "RISK": return None
+    log.info(f"🛡️ [{domain}] Trademark Protection Query │ Risk: {tm_data.get('risk')} │ Conflict Matches: {tm_data.get('matches', 0)}")
+    if tm_data["risk"] == "RISK":
+        log.warning(f"❌ [SKIP] {domain} eliminated due to active USPTO trademark conflict.")
+        return None
     
+    log.info(f"📡 [{domain}] Extracting active public metrics footprints from web archives...")
     bl = fetch_wayback_backlinks(domain)
     snaps = fetch_wayback_snapshots(domain)
     cc = fetch_commoncrawl_presence(domain)
+    log.info(f"📊 [{domain}] Footprint Matrix │ Backlinks: {bl} │ Snapshots: {snaps} │ CommonCrawl Hits: {cc}")
     
+    log.info(f"🎭 [{domain}] Scraping alternative news clusters for sentiment indexing...")
     sent_data = sent.analyze_asset_sentiment(sld)
+    log.info(f"💬 [{domain}] Sentiment Matrix │ Polarity Compound: {sent_data['compound']:+.4f} │ Score: {sent_data['sentiment_score']:.1f}")
+    
     seo_data = seo.evaluate_arbitrage(domain, niche, age, bl, cc, tld)
+    log.info(f"📈 [{domain}] SEO Arbitrage Matrix │ Niche: {niche.upper()} │ Computed SEO Score: {seo_data['seo_score']:.1f}")
+    
     comp_median = fetch_local_namebio_median(conn, sld)
+    if comp_median > 0:
+        log.info(f"💰 [{domain}] Local NameBio Ledger Match │ Historical Median Comp Sale: ${comp_median:,.0f}")
     
     found_score = min(100.0, (bl / 3.0) * 32.0 + (cc * 20.0) * 26.0 + (age * 5.0) * 24.0)
     brand_score = 85.0 if len(sld) <= 7 and "-" not in sld else 40.0
     
     final_score = int((found_score * 0.25) + (brand_score * 0.25) + (sent_data["sentiment_score"] * 0.3) + (TLD_VALUE.get(tld, 20) * 0.2))
-    if final_score < 40: return None
     
+    if final_score < 40:
+        log.warning(f"⚠️ [SKIP] {domain} dropped. Final Composite Score ({final_score}) sits below alpha threshold floor (40).")
+        return None
+        
     prob_engine = ProbabilityEngine()
     p_win = prob_engine.p_flip_success(final_score, niche, age, bl)
     mc_data = prob_engine.monte_carlo_flip_value(max(comp_median, snaps * 12.0, age * 75.0), niche)
     k_data = prob_engine.kelly_allocation(p_win, mc_data["p50"])
     
+    log.info(f"🏁 [SUCCESS] Scored Asset Allocation Calculated for {domain} │ Total Score: {final_score} │ P(Win): {p_win:.1%} │ Kelly: {k_data['verdict']}")
+    
     return {
         "domain": domain, "source": source, "final_score": final_score, "niche": niche,
         "foundation": found_score, "age_years": age, "sentiment_compound": sent_data["compound"],
         "sentiment_score": sent_data["sentiment_score"], "p_flip_success": p_win, 
-        "mc_ci95": mc_data["ci95"], # FIX 3: Replaced raw number output mapping with true string format ranges
+        "mc_ci95": mc_data["ci95"], 
         "kelly_verdict": k_data["verdict"], "kelly_alloc_usd": k_data["allocation_usd"], "link_sedo": f"https://sedo.com/search/details/?domain={domain}"
     }
 
