@@ -954,7 +954,8 @@ def process_domain(domain:str, source:str, conn, seo:SEOIntelligence,
     mc = _prob_engine.monte_carlo_flip_value(max(flip_est,me), niche)
     kelly = _prob_engine.kelly_allocation(p_win, mc["p50"])
     aff = build_affiliate_links(domain)
-    cps, best_combo, _ = _combo_engine.score_combination([sld], tld)  # simplified
+    cps = _combo_engine.score_combination([sld], tld)
+best_combo = ""    # not used, but keep the variable
 
     return {
         "fetched_at": datetime.utcnow().isoformat(),
