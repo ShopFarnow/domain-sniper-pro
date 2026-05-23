@@ -1,46 +1,38 @@
-cat > /mnt/user-data/outputs/domain_sniper_v5.py << 'PYEOF'
 #!/usr/bin/env python3
 """
 Domain Fortress Sniper – Institutional Quantitative Edition (v5)
 
-═══════════════════════════════════════════════════════════════════
-CHANGES FROM v4
-═══════════════════════════════════════════════════════════════════
-
-  CHANGE 1 — SAVE EVERY SCAN, ALERT ONLY SCORE > 85
-  ──────────────────────────────────────────────────
-  • All domains evaluated (any score) are written to `daily_scans`
-    table immediately after scoring. This table is the raw data
-    warehouse — no score gate, no filtering.
-  • Telegram alerts fire ONLY when final_score > 85 (strict >, not ≥).
-  • domain_outcomes (the outcome tracker) is written only for alerted
-    domains (score > 85), since those are the ones we might register.
-  • The separation means: daily_scans feeds the monthly AI analysis
-    with the full picture; domain_outcomes tracks our real decisions.
-
-  CHANGE 2 — ENHANCED MONTHLY AI ANALYSIS (3 new pillars)
-  ─────────────────────────────────────────────────────────
-  Pillar A: Sale Price Analysis
-    Claude now receives sold domain prices, average days-to-sell,
-    price distribution by niche, and ROI multiples. It returns
-    price benchmarks and niche-specific sell targets.
-
-  Pillar B: Trend-Based Forward Domain Projections
-    The radar scans the last 30 days of trending keywords from
-    daily_scans. Claude cross-references those with macro news
-    signals (e.g. "jio", "starlink", "gemini", "sora") to project
-    which domain patterns are likely to spike in value in the next
-    30-90 days and recommends specific domain names to watch/register
-    proactively.
-
-  Pillar C: System Improvement Recommendations
-    Claude audits the scoring weights, niche miss-rate (domains that
-    slipped through as "general"), flip-rate by TLD, and sentiment
-    accuracy. It returns concrete code-level suggestions (e.g.
-    "raise bonus_niche from 5 → 8", "add 'robotics' to NICHE_MAP").
-
-  All three pillars are saved to `learning_snapshots` and pushed to
-  Telegram as a monthly digest message (separate from domain alerts).
+CHANGES FROM v4:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  FIX 5 — Comprehensive Memory (Rejected Domain Logging)         │
+  │  Every domain evaluated is now marked in seen_domains,          │
+  │  regardless of score. Domains that fail the score gate or       │
+  │  trademark check are recorded with score=0, monetization_path   │
+  │  = "rejected". This prevents silent re-evaluation across runs,  │
+  │  eliminating wasted WHOIS/Wayback/CC network calls.             │
+  ├─────────────────────────────────────────────────────────────────┤
+  │  FIX 6 — daily_scans Table (Full Audit Trail, No Score Gate)    │
+  │  A new table `daily_scans` captures every domain that enters    │
+  │  process_domain(), including rejections. Columns include all    │
+  │  scoring inputs so no data is silently discarded. Telegram      │
+  │  and domain_outcomes are downstream of score ≥ 85 only.        │
+  │  Score gate raised from ≥ 80 → > 85 (strict inequality).       │
+  ├─────────────────────────────────────────────────────────────────┤
+  │  FIX 7 — Telegram Score Gate Raised to > 85                     │
+  │  MIN_ALERT_SCORE still controls process_domain() exit but the   │
+  │  Telegram send + outcome tracking now require final_score > 85. │
+  │  So at MIN_ALERT_SCORE=80, domains scoring 81-85 are logged     │
+  │  to daily_scans and domain_outcomes but NOT Telegammed.         │
+  ├─────────────────────────────────────────────────────────────────┤
+  │  FIX 8 — Enriched AI Learning Engine (Monthly Claude Analysis)  │
+  │  _call_claude() now receives:                                    │
+  │    • sale_price_distribution (p10/median/p90 of actual sales)   │
+  │    • niche_trend_projections (jioai-style domain examples per   │
+  │      niche, auto-generated from recent trend keywords)           │
+  │    • system_weaknesses (Claude asked to find 3 failure modes)   │
+  │  Claude response now includes "system_improvements" key with    │
+  │  concrete code-level suggestions surfaced to the operator log.  │
+  └─────────────────────────────────────────────────────────────────┘
 """
 
 import os, sys, re, json, sqlite3, logging, math, random
@@ -95,16 +87,16 @@ TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
 GOOGLE_CREDS_JSON    = os.getenv("GOOGLE_CREDS_JSON", "")
 GOOGLE_SHEET_ID      = os.getenv("GOOGLE_SHEET_ID", "")
 SHEET_NAME           = os.getenv("SHEET_NAME", "DomainSniperV5")
-
-# ── TWO separate score thresholds ──────────────────────────────
-SAVE_ALL_SCORE       = int(os.getenv("SAVE_ALL_SCORE",   "0"))   # save everything ≥ 0
-TELEGRAM_MIN_SCORE   = int(os.getenv("TELEGRAM_MIN_SCORE", "85")) # alert only when > 85
-
+MIN_ALERT_SCORE      = int(os.getenv("MIN_ALERT_SCORE", "80"))
+TELEGRAM_SCORE_GATE  = int(os.getenv("TELEGRAM_SCORE_GATE", "85"))   # FIX 7
 DB_PATH              = os.getenv("DB_PATH", "domain_sniper_v5.db")
 KELLY_BANKROLL       = float(os.getenv("KELLY_BANKROLL", "10000"))
 KELLY_FRACTION       = float(os.getenv("KELLY_FRACTION", "0.25"))
 ENABLE_TRADEMARK     = os.getenv("USPTO_SEARCH", "1") == "1"
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
+REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "DomainSniperV5/1.0")
 AFFILIATE_ID_GD      = os.getenv("AFFILIATE_ID_GD", "")
 AFFILIATE_ID_NC      = os.getenv("AFFILIATE_ID_NC", "")
 
@@ -145,9 +137,9 @@ NICHE_MAP = {
     "education":  {"score": 80, "cpc": 10.50, "max_p_flip": 0.11},
     "general":    {"score": 30, "cpc":  0.50, "max_p_flip": 0.03},
 }
-NICHE_SCORE     = {k: v["score"]     for k, v in NICHE_MAP.items()}
-NICHE_CPC       = {k: v["cpc"]       for k, v in NICHE_MAP.items()}
-NICHE_MAX_PFLIP = {k: v["max_p_flip"] for k, v in NICHE_MAP.items()}
+NICHE_SCORE    = {k: v["score"]     for k, v in NICHE_MAP.items()}
+NICHE_CPC      = {k: v["cpc"]       for k, v in NICHE_MAP.items()}
+NICHE_MAX_PFLIP= {k: v["max_p_flip"] for k, v in NICHE_MAP.items()}
 
 BLOCKED_BRAND_KEYWORDS = {
     "microsoft","google","apple","amazon","meta","openai","tesla","nvidia",
@@ -160,41 +152,42 @@ BLOCKED_BRAND_KEYWORDS = {
 DYNAMIC_CC_URL = "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
 
 SCORING_WEIGHTS = {
-    "found_score":     0.25,
-    "brand_score":     0.25,
-    "sentiment_score": 0.30,
-    "tld_value":       0.20,
-    "bonus_age":       4,
-    "bonus_backlinks": 3,
-    "bonus_niche":     5,
-    "bonus_short":     3,
+    "found_score":       0.25,
+    "brand_score":       0.25,
+    "sentiment_score":   0.30,
+    "tld_value":         0.20,
+    "bonus_age":         4,
+    "bonus_backlinks":   3,
+    "bonus_niche":       5,
+    "bonus_short":       3,
 }
 
 # ─────────────────────────── NLP NICHE CLASSIFIER ──────────────
 class NLPNicheClassifier:
     NICHE_SEEDS = {
-        "insurance":  ["insurance","insure","cover","coverage","policy","premium","claim"],
+        "insurance":  ["insurance","insure","cover","coverage","policy","premium","claim","underwrite"],
         "loan":       ["loan","lend","lending","credit","debt","borrow","finance","repay"],
-        "mortgage":   ["mortgage","refinance","equity","amortize","lender"],
-        "crypto":     ["crypto","bitcoin","blockchain","token","wallet","defi","coin"],
-        "ai":         ["intelligence","machine","learning","neural","llm","gpt","inference","artificial"],
-        "saas":       ["software","subscription","platform","cloud","dashboard","api"],
-        "lawyer":     ["lawyer","legal","attorney","court","litigation","counsel"],
-        "realestate": ["property","housing","rent","apartment","listing","realty","estate"],
-        "fintech":    ["fintech","payment","banking","neobank","invoice","transfer"],
-        "health":     ["health","medical","wellness","supplement","vitamin","nutrition",
-                       "therapy","clinic","pure","organic","natural","remedy","pharmacy"],
-        "ecommerce":  ["shop","store","buy","sell","cart","checkout","retail","market"],
-        "food":       ["food","recipe","restaurant","meal","diet","cooking","snack"],
-        "travel":     ["travel","hotel","flight","trip","vacation","tourism","resort"],
-        "education":  ["course","learn","school","training","certificate","tutor","study"],
-        "biotech":    ["biotech","gene","genome","protein","drug","pharma","clinical"],
-        "quantum":    ["quantum","qubit","superposition","entangle"],
-        "llm":        ["llm","language","transformer","prompt","embedding","finetune"],
-        "fintech":    ["fintech","payment","banking","neobank","invoice"],
+        "mortgage":   ["mortgage","refinance","home loan","equity","amortize","lender"],
+        "crypto":     ["crypto","bitcoin","blockchain","token","wallet","defi","exchange","coin"],
+        "ai":         ["artificial intelligence","machine learning","neural","llm","gpt","nlp","model","inference"],
+        "saas":       ["software","subscription","platform","cloud","tool","dashboard","app","api"],
+        "lawyer":     ["lawyer","legal","attorney","law","court","litigation","counsel","contract"],
+        "realestate": ["real estate","property","housing","rent","apartment","listing","agent","realty"],
+        "fintech":    ["fintech","payment","transaction","banking","wallet","neobank","invoice","transfer"],
+        "health":     ["health","medical","wellness","supplement","vitamin","nutrition","therapy","care","clinic","pure","organic","natural","remedy","pharmacy"],
+        "ecommerce":  ["shop","store","buy","sell","cart","checkout","ecommerce","retail","product","order","market","marketplace"],
+        "food":       ["food","recipe","restaurant","meal","diet","cooking","ingredient","cuisine","snack","drink"],
+        "travel":     ["travel","hotel","flight","trip","vacation","tourism","booking","destination","resort"],
+        "education":  ["course","learn","school","training","certificate","tutor","education","skill","study"],
+        "biotech":    ["biotech","gene","genome","protein","drug","pharma","molecule","clinical","research"],
+        "quantum":    ["quantum","qubit","superposition","entangle","computing"],
+        "llm":        ["llm","language model","transformer","prompt","fine-tune","embedding"],
     }
 
     def __init__(self):
+        self._build_index()
+
+    def _build_index(self):
         self._word_map: Dict[str, str] = {}
         for niche, terms in self.NICHE_SEEDS.items():
             for t in terms:
@@ -205,12 +198,12 @@ class NLPNicheClassifier:
     def _spacy_classify(self, text: str) -> Optional[str]:
         if not SPACY_OK or _NLP is None:
             return None
-        doc   = _NLP(text.lower())
+        doc = _NLP(text.lower())
+        lemmas = [token.lemma_ for token in doc if not token.is_stop and len(token.lemma_) >= 4]
         votes: Counter = Counter()
-        for token in doc:
-            if not token.is_stop and len(token.lemma_) >= 4:
-                if token.lemma_ in self._word_map:
-                    votes[self._word_map[token.lemma_]] += 1
+        for lemma in lemmas:
+            if lemma in self._word_map:
+                votes[self._word_map[lemma]] += 1
         return votes.most_common(1)[0][0] if votes else None
 
     def _keyword_classify(self, text: str) -> Optional[str]:
@@ -222,13 +215,15 @@ class NLPNicheClassifier:
         return votes.most_common(1)[0][0] if votes else None
 
     def classify(self, domain: str) -> str:
-        sld      = domain.split(".")[0].lower()
+        sld = domain.split(".")[0].lower()
         expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", sld).replace("-", " ")
-        result   = self._spacy_classify(expanded) or self._keyword_classify(expanded)
+        result = self._spacy_classify(expanded) or self._keyword_classify(expanded)
         if result and result in NICHE_MAP:
+            log.debug(f"  NLP niche → {result} for '{expanded}'")
             return result
         clean = sld.replace("-", "")
         return next((k for k in NICHE_SCORE if k in clean), "general")
+
 
 _NICHE_CLASSIFIER = NLPNicheClassifier()
 
@@ -239,7 +234,6 @@ def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     ddls = [
-        # ── existing tables ─────────────────────────────────────────
         """CREATE TABLE IF NOT EXISTS seen_domains (
                domain TEXT PRIMARY KEY, first_seen TEXT,
                final_score INTEGER, monetization_path TEXT)""",
@@ -259,34 +253,6 @@ def init_db() -> sqlite3.Connection:
                keyword TEXT PRIMARY KEY, cpc REAL, search_vol_proxy REAL,
                serp_competition REAL, intent_class TEXT, seo_score REAL,
                fetched_at TEXT, expires_at TEXT)""",
-
-        # ── CHANGE 1: daily_scans — every domain evaluated, no gate ─
-        """CREATE TABLE IF NOT EXISTS daily_scans (
-               id               INTEGER PRIMARY KEY AUTOINCREMENT,
-               scan_date        TEXT,
-               run_id           TEXT,
-               domain           TEXT,
-               tld              TEXT,
-               niche            TEXT,
-               final_score      INTEGER,
-               base_score       INTEGER,
-               bonus            INTEGER,
-               age_years        INTEGER,
-               brand_score      REAL,
-               sentiment_score  REAL,
-               sentiment_compound REAL,
-               backlinks        INTEGER,
-               cpc              REAL,
-               mc_p50           REAL,
-               reg_cost_usd     REAL,
-               p_flip_success   REAL,
-               kelly_verdict    TEXT,
-               kelly_alloc_usd  REAL,
-               worthiness_label TEXT,
-               telegram_alerted INTEGER DEFAULT 0,
-               source           TEXT)""",
-
-        # ── outcome tracker (only for alerted domains) ───────────────
         """CREATE TABLE IF NOT EXISTS domain_outcomes (
                domain            TEXT PRIMARY KEY,
                first_alert_date  TEXT,
@@ -309,23 +275,51 @@ def init_db() -> sqlite3.Connection:
                days_to_sell      INTEGER DEFAULT 0,
                outcome_notes     TEXT    DEFAULT '',
                updated_at        TEXT)""",
-
-        # ── AI learning snapshots (enhanced in v5) ───────────────────
+        # ── FIX 6: daily_scans — full audit trail, no score gate ──────────
+        """CREATE TABLE IF NOT EXISTS daily_scans (
+               scan_id           TEXT PRIMARY KEY,
+               run_id            TEXT,
+               scanned_at        TEXT,
+               domain            TEXT,
+               source            TEXT,
+               tld               TEXT,
+               niche             TEXT,
+               age_years         INTEGER,
+               brand_score       REAL,
+               sentiment_score   REAL,
+               sentiment_compound REAL,
+               headline_count    INTEGER,
+               backlinks         INTEGER,
+               snapshots         INTEGER,
+               cc_hits           INTEGER,
+               found_score       REAL,
+               base_score        INTEGER,
+               bonus             INTEGER,
+               final_score       INTEGER,
+               cpc               REAL,
+               p_flip_success    REAL,
+               mc_p10            REAL,
+               mc_p50            REAL,
+               mc_p90            REAL,
+               reg_cost_usd      REAL,
+               kelly_verdict     TEXT,
+               kelly_alloc_usd   REAL,
+               worthiness_label  TEXT,
+               trademark_risk    TEXT,
+               rejection_reason  TEXT)""",
         """CREATE TABLE IF NOT EXISTS learning_snapshots (
-               snapshot_id           TEXT PRIMARY KEY,
-               generated_at          TEXT,
-               domains_tracked       INTEGER,
-               avg_score             REAL,
-               conversion_rate       REAL,
-               flip_rate             REAL,
-               avg_sale_price        REAL,
-               best_niche            TEXT,
-               worst_niche           TEXT,
-               ai_insights           TEXT,
-               sale_price_analysis   TEXT,
-               forward_projections   TEXT,
-               system_recommendations TEXT,
-               recommended_weights   TEXT)""",
+               snapshot_id       TEXT PRIMARY KEY,
+               generated_at      TEXT,
+               domains_tracked   INTEGER,
+               avg_score         REAL,
+               conversion_rate   REAL,
+               flip_rate         REAL,
+               avg_sale_price    REAL,
+               best_niche        TEXT,
+               worst_niche       TEXT,
+               ai_insights       TEXT,
+               recommended_weights TEXT,
+               system_improvements TEXT)""",
     ]
     for ddl in ddls:
         c.execute(ddl)
@@ -346,6 +340,10 @@ def is_seen(conn, d: str) -> bool:
     ).fetchone() is not None
 
 def mark_seen(conn, d: str, score: int, path: str):
+    """
+    FIX 5 — called for every domain regardless of score.
+    path="rejected" for score failures, "flip" for successes.
+    """
     db_write(conn,
         "INSERT OR REPLACE INTO seen_domains VALUES(?,?,?,?)",
         (d, datetime.utcnow().isoformat(), score, path))
@@ -376,36 +374,56 @@ def put_cached(conn, table: str, key: str, data: Dict, ttl_hours: int = 6):
         f"INSERT OR REPLACE INTO {table}(keyword,{','.join(cols)}) VALUES(?,{ph})",
         (key,) + tuple(vals))
 
-# ─────────────────────────── DAILY SCAN LOGGER ─────────────────
-def log_daily_scan(conn, run_id: str, res: Dict,
-                   base_score: int, bonus: int, alerted: bool):
+# ─────────────────────────── DAILY SCAN LOGGER (FIX 6) ─────────
+def log_daily_scan(conn, run_id: str, domain: str, source: str,
+                   scan_data: Dict, rejection_reason: str = ""):
     """
-    CHANGE 1 — Write every evaluated domain to daily_scans.
-    Called for ALL domains that pass pre-filters, regardless of score.
+    Writes every evaluated domain to daily_scans before any score gate.
+    scan_data must contain all raw scoring inputs.
     """
+    scan_id = f"{run_id}_{domain.replace('.','_')}"
     db_write(conn, """
-        INSERT INTO daily_scans (
-            scan_date, run_id, domain, tld, niche, final_score,
-            base_score, bonus, age_years, brand_score,
-            sentiment_score, sentiment_compound, backlinks,
-            cpc, mc_p50, reg_cost_usd, p_flip_success,
-            kelly_verdict, kelly_alloc_usd, worthiness_label,
-            telegram_alerted, source
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT OR IGNORE INTO daily_scans (
+            scan_id, run_id, scanned_at, domain, source, tld, niche, age_years,
+            brand_score, sentiment_score, sentiment_compound, headline_count,
+            backlinks, snapshots, cc_hits, found_score, base_score, bonus,
+            final_score, cpc, p_flip_success, mc_p10, mc_p50, mc_p90,
+            reg_cost_usd, kelly_verdict, kelly_alloc_usd, worthiness_label,
+            trademark_risk, rejection_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        datetime.utcnow().date().isoformat(), run_id,
-        res["domain"], res["tld"], res["niche"], res["final_score"],
-        base_score, bonus, res["age_years"], res["brand_score"],
-        res["sentiment_score"], res["sentiment_compound"], res["backlinks"],
-        res["cpc"], res["mc_p50"], res["reg_cost_usd"],
-        res["p_flip_success"], res["kelly_verdict"], res["kelly_alloc_usd"],
-        res["worthiness_label"], int(alerted), res["source"],
+        scan_id, run_id, datetime.utcnow().isoformat(),
+        domain, source,
+        scan_data.get("tld", ""),
+        scan_data.get("niche", ""),
+        scan_data.get("age_years", 0),
+        scan_data.get("brand_score", 0.0),
+        scan_data.get("sentiment_score", 50.0),
+        scan_data.get("sentiment_compound", 0.0),
+        scan_data.get("headline_count", 0),
+        scan_data.get("backlinks", 0),
+        scan_data.get("snapshots", 0),
+        scan_data.get("cc_hits", 0),
+        scan_data.get("found_score", 0.0),
+        scan_data.get("base_score", 0),
+        scan_data.get("bonus", 0),
+        scan_data.get("final_score", 0),
+        scan_data.get("cpc", 0.0),
+        scan_data.get("p_flip_success", 0.0),
+        scan_data.get("mc_p10", 0.0),
+        scan_data.get("mc_p50", 0.0),
+        scan_data.get("mc_p90", 0.0),
+        scan_data.get("reg_cost_usd", 0.0),
+        scan_data.get("kelly_verdict", ""),
+        scan_data.get("kelly_alloc_usd", 0.0),
+        scan_data.get("worthiness_label", ""),
+        scan_data.get("trademark_risk", "UNCHECKED"),
+        rejection_reason,
     ))
 
-# ─────────────────────────── OUTCOME TRACKER ───────────────────
+# ─────────────────────────── TRACKER ───────────────────────────
 def track_domain_alert(conn, res: Dict, mc_p10: float, mc_p50: float, mc_p90: float,
                        brand_score: float, backlinks: int):
-    """Only called for domains that triggered a Telegram alert (score > 85)."""
     db_write(conn, """
         INSERT OR IGNORE INTO domain_outcomes (
             domain, first_alert_date, alert_score, reg_cost_usd, niche,
@@ -419,12 +437,11 @@ def track_domain_alert(conn, res: Dict, mc_p10: float, mc_p50: float, mc_p90: fl
         res["tld"], res["kelly_verdict"], res["kelly_alloc_usd"],
         mc_p10, mc_p50, mc_p90, datetime.utcnow().isoformat(),
     ))
-    log.info(f"📋 Outcome tracked for {res['domain']}")
+    log.info(f"📋 Tracked outcome for {res['domain']}")
 
 def update_outcome(conn, domain: str, registered: bool = False,
                    sold: bool = False, sale_price: float = 0.0,
                    days_to_sell: int = 0, notes: str = ""):
-    """Call manually or via CLI to record what happened after registration."""
     db_write(conn, """
         UPDATE domain_outcomes SET
             registered=?, sold=?, sale_price_usd=?,
@@ -433,21 +450,12 @@ def update_outcome(conn, domain: str, registered: bool = False,
     """, (int(registered), int(sold), sale_price,
           days_to_sell, notes, datetime.utcnow().isoformat(), domain))
 
-# ─────────────────────────── AI LEARNING ENGINE (v5) ───────────
+# ─────────────────────────── AI LEARNING ENGINE (FIX 8) ────────
 class AILearningEngine:
-    """
-    Monthly analysis with 3 pillars:
-      A. Sale Price Analysis
-      B. Forward Domain Projections (trend-based, e.g. jioai-style)
-      C. System Improvement Recommendations
-    """
-
     def __init__(self, conn):
         self.conn = conn
 
-    # ── data fetchers ────────────────────────────────────────────
-
-    def _fetch_outcome_data(self) -> List[Dict]:
+    def _fetch_30day_data(self) -> List[Dict]:
         cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
         rows = self.conn.execute("""
             SELECT domain, alert_score, niche, age_years, sentiment_score,
@@ -461,205 +469,160 @@ class AILearningEngine:
                 "mc_p50","registered","sold","sale_price_usd","days_to_sell"]
         return [dict(zip(cols, r)) for r in rows]
 
-    def _fetch_daily_scan_data(self) -> List[Dict]:
-        """Pull 30 days of ALL scanned domains for trend and miss-rate analysis."""
+    def _fetch_30day_scans(self) -> List[Dict]:
+        """FIX 8 — pull from daily_scans for sale price distribution analysis."""
         cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
         rows = self.conn.execute("""
-            SELECT domain, niche, final_score, age_years, cpc, tld,
-                   telegram_alerted, scan_date, worthiness_label
-            FROM daily_scans WHERE scan_date >= ?
-            ORDER BY final_score DESC
-        """, (cutoff[:10],)).fetchall()
-        cols = ["domain","niche","final_score","age_years","cpc","tld",
-                "telegram_alerted","scan_date","worthiness_label"]
+            SELECT niche, final_score, mc_p10, mc_p50, mc_p90,
+                   p_flip_success, rejection_reason, worthiness_label
+            FROM daily_scans WHERE scanned_at >= ?
+        """, (cutoff,)).fetchall()
+        cols = ["niche","final_score","mc_p10","mc_p50","mc_p90",
+                "p_flip_success","rejection_reason","worthiness_label"]
         return [dict(zip(cols, r)) for r in rows]
 
-    def _build_sale_price_stats(self, outcomes: List[Dict]) -> Dict:
-        """Pillar A: sale price breakdown."""
-        sold   = [d for d in outcomes if d["sold"] and d["sale_price_usd"] > 0]
-        reg    = [d for d in outcomes if d["registered"]]
-        unsold = [d for d in reg if not d["sold"]]
+    def _fetch_recent_trend_keywords(self) -> List[str]:
+        """FIX 8 — pull top trend keywords from trend_cache for projection examples."""
+        rows = self.conn.execute("""
+            SELECT keyword FROM trend_cache
+            WHERE expires_at > ?
+            ORDER BY trend_pct DESC LIMIT 10
+        """, (datetime.utcnow().isoformat(),)).fetchall()
+        return [r[0] for r in rows]
 
+    def _build_stats(self, data: List[Dict]) -> Dict:
+        if not data:
+            return {}
+        total      = len(data)
+        registered = sum(1 for d in data if d["registered"])
+        sold       = sum(1 for d in data if d["sold"])
+        sold_data  = [d for d in data if d["sold"] and d["sale_price_usd"] > 0]
+        avg_sale   = sum(d["sale_price_usd"] for d in sold_data) / len(sold_data) if sold_data else 0
+        niche_flip = Counter(d["niche"] for d in data if d["sold"])
+        niche_reg  = Counter(d["niche"] for d in data if d["registered"])
+        return {
+            "total_alerted":   total,
+            "registered":      registered,
+            "sold":            sold,
+            "conversion_rate": round(registered / total, 3) if total else 0,
+            "flip_rate":       round(sold / registered, 3) if registered else 0,
+            "avg_sale_usd":    round(avg_sale, 2),
+            "best_niches":     [n for n, _ in niche_flip.most_common(3)],
+            "worst_niches":    [n for n, _ in niche_reg.most_common() if n not in niche_flip],
+            "avg_score":       round(sum(d["alert_score"] for d in data)/total, 1),
+            "raw_sample":      data[:20],
+        }
+
+    def _build_sale_price_distribution(self, scans: List[Dict]) -> Dict:
+        """FIX 8 — compute p10/median/p90 of mc_p50 estimates by niche."""
         by_niche: Dict[str, List[float]] = {}
-        by_tld:   Dict[str, List[float]] = {}
-        roi_multiples = []
-        days_list = []
-
-        for d in sold:
-            by_niche.setdefault(d["niche"], []).append(d["sale_price_usd"])
-            by_tld.setdefault(d["tld"], []).append(d["sale_price_usd"])
-            roi_multiples.append(d["sale_price_usd"] / max(1, d["kelly_alloc_usd"]))
-            days_list.append(d["days_to_sell"])
-
-        def _stats(lst):
-            if not lst: return {}
-            lst_s = sorted(lst)
-            n = len(lst_s)
-            return {
-                "count": n,
-                "min":   round(lst_s[0], 2),
-                "p25":   round(lst_s[n//4], 2),
-                "median":round(lst_s[n//2], 2),
-                "p75":   round(lst_s[3*n//4], 2),
-                "max":   round(lst_s[-1], 2),
-                "mean":  round(sum(lst_s)/n, 2),
-            }
-
-        return {
-            "total_sold":          len(sold),
-            "total_registered":    len(reg),
-            "total_unsold":        len(unsold),
-            "avg_sale_price_usd":  round(sum(d["sale_price_usd"] for d in sold)/len(sold), 2) if sold else 0,
-            "avg_days_to_sell":    round(sum(days_list)/len(days_list), 1) if days_list else 0,
-            "sale_price_dist":     _stats([d["sale_price_usd"] for d in sold]),
-            "roi_multiples":       _stats(roi_multiples),
-            "by_niche":            {n: _stats(v) for n, v in by_niche.items()},
-            "by_tld":              {t: _stats(v) for t, v in by_tld.items()},
-            "sold_sample":         [{"domain": d["domain"], "niche": d["niche"],
-                                     "sale_usd": d["sale_price_usd"],
-                                     "days": d["days_to_sell"],
-                                     "score": d["alert_score"]} for d in sold[:15]],
-        }
-
-    def _build_scan_stats(self, scans: List[Dict]) -> Dict:
-        """Stats from daily_scans for Pillars B and C."""
-        total = len(scans)
-        alerted = sum(1 for s in scans if s["telegram_alerted"])
-        niche_miss = Counter(s["niche"] for s in scans if s["niche"] == "general")
-        niche_dist = Counter(s["niche"] for s in scans)
-        tld_dist   = Counter(s["tld"]   for s in scans)
-        # Top trend keywords that kept appearing
-        kw_tokens: Counter = Counter()
         for s in scans:
-            for tok in re.findall(r"[a-z]{4,}", s["domain"].split(".")[0]):
-                kw_tokens[tok] += 1
-        return {
-            "total_scans":          total,
-            "total_alerted":        alerted,
-            "alert_rate_pct":       round(100 * alerted / total, 1) if total else 0,
-            "general_niche_count":  niche_miss.total(),
-            "general_niche_pct":    round(100 * niche_miss.total() / total, 1) if total else 0,
-            "niche_distribution":   dict(niche_dist.most_common(10)),
-            "tld_distribution":     dict(tld_dist.most_common()),
-            "top_keyword_tokens":   dict(kw_tokens.most_common(20)),
-            "score_distribution": {
-                "90_100": sum(1 for s in scans if s["final_score"] >= 90),
-                "85_89":  sum(1 for s in scans if 85 <= s["final_score"] < 90),
-                "70_84":  sum(1 for s in scans if 70 <= s["final_score"] < 85),
-                "below70": sum(1 for s in scans if s["final_score"] < 70),
-            },
-        }
+            if s["mc_p50"] > 0:
+                by_niche.setdefault(s["niche"], []).append(s["mc_p50"])
+        dist = {}
+        for niche, prices in by_niche.items():
+            prices.sort()
+            n = len(prices)
+            dist[niche] = {
+                "p10":    round(prices[max(0, int(n * 0.10))], 0),
+                "median": round(prices[int(n * 0.50)], 0) if n > 1 else round(prices[0], 0),
+                "p90":    round(prices[min(n-1, int(n * 0.90))], 0),
+                "count":  n,
+            }
+        return dist
 
-    def _call_claude(self, outcomes: List[Dict], sale_stats: Dict,
-                     scan_stats: Dict) -> Optional[Dict]:
+    def _build_trend_projections(self, trend_keywords: List[str]) -> List[Dict]:
         """
-        Single Claude call covering all 3 pillars.
-        Returns structured JSON with sale_price_analysis, forward_projections,
-        system_recommendations, and scoring weights.
+        FIX 8 — generate jioai-style domain name examples per niche,
+        using real trend keywords from the last scan cycle.
+        Purely illustrative (not registered or checked), for Claude's
+        strategic analysis.
+        """
+        affixes = ["get","ai","pro","hub","lab","use"]
+        tlds    = [".com", ".ai", ".io"]
+        projections = []
+        for kw in trend_keywords[:8]:
+            niche = _NICHE_CLASSIFIER.classify(kw + ".com")
+            examples = []
+            for affix in affixes[:3]:
+                for tld in tlds[:2]:
+                    examples.append(f"{affix}{kw}{tld}")
+                    examples.append(f"{kw}{affix}{tld}")
+            projections.append({
+                "trend_keyword": kw,
+                "inferred_niche": niche,
+                "domain_examples": examples[:6],
+            })
+        return projections
+
+    def _call_claude(self, stats: Dict, sale_distribution: Dict,
+                     trend_projections: List[Dict]) -> Optional[Dict]:
+        """
+        FIX 8 — enriched prompt includes:
+          • sale_price_distribution per niche
+          • trend_projections (jioai-style examples)
+          • explicit request for system_improvements
         """
         if not ANTHROPIC_API_KEY:
-            log.warning("ANTHROPIC_API_KEY not set — skipping AI analysis")
+            log.warning("ANTHROPIC_API_KEY not set — skipping AI learning")
             return None
 
         prompt = f"""
-You are a domain investing AI analyst reviewing a month of automated domain sniper data.
+You are a domain investing AI analyst reviewing 30-day performance data from an automated domain sniper tool (v5).
 
-══════════════════════════════════════════
-PILLAR A — SALE PRICE ANALYSIS
-══════════════════════════════════════════
-{json.dumps(sale_stats, indent=2)}
+=== PERFORMANCE STATS ===
+{json.dumps(stats, indent=2)}
 
-══════════════════════════════════════════
-PILLAR B — SCAN STATS + KEYWORD SIGNALS
-(30-day snapshot of ALL evaluated domains)
-══════════════════════════════════════════
-{json.dumps(scan_stats, indent=2)}
-
-══════════════════════════════════════════
-CURRENT SCORING WEIGHTS
-══════════════════════════════════════════
+=== CURRENT SCORING WEIGHTS ===
 {json.dumps(SCORING_WEIGHTS, indent=2)}
 
-══════════════════════════════════════════
-TASK
-══════════════════════════════════════════
-Return ONLY a valid JSON object (no markdown, no explanation outside JSON) with exactly these keys:
+=== SALE PRICE DISTRIBUTION BY NICHE (Monte Carlo p10/median/p90 from all scans) ===
+{json.dumps(sale_distribution, indent=2)}
+
+=== TREND-BASED DOMAIN PROJECTIONS (jioai-style examples from recent trend keywords) ===
+{json.dumps(trend_projections, indent=2)}
+
+=== YOUR TASK ===
+Analyse all three data sources and return ONLY a valid JSON object (no markdown, no explanation) with these keys:
 
 {{
-  "insights": "3-4 sentence executive summary of the month",
-
-  "sale_price_analysis": {{
-    "summary": "What do sale prices tell us about real market value?",
-    "niche_benchmarks": {{
-      "niche_name": {{"target_sell_price_usd": 0, "avg_days_to_sell": 0, "roi_multiple": 0}}
-    }},
-    "pricing_strategy": "Concrete advice: when to list at what price, which platform per niche",
-    "red_flags": ["domains that sold below MC p50 and why"]
-  }},
-
-  "forward_projections": {{
-    "summary": "Based on keyword signals and macro trends, what domain patterns will spike 30-90 days from now?",
-    "projected_niches": ["niche1", "niche2"],
-    "specific_domain_ideas": [
-      {{
-        "domain": "example.ai",
-        "rationale": "why this specific name",
-        "estimated_value_usd": 0,
-        "register_by": "YYYY-MM-DD",
-        "confidence": "high/medium/low"
-      }}
-    ],
-    "trend_keywords_to_watch": ["keyword1", "keyword2"],
-    "india_specific": "Domains tied to Indian market trends (e.g. jioai, upifast, bharatllm) worth watching"
-  }},
-
-  "system_recommendations": {{
-    "summary": "Top 3 concrete improvements for next month",
-    "scoring_fixes": [
-      "e.g. raise bonus_niche from 5 to 8 because general-niche domains scored too high"
-    ],
-    "niche_map_additions": [
-      {{"niche": "robotics", "suggested_cpc": 9.0, "seeds": ["robot","drone","autonomous"]}}
-    ],
-    "data_quality_issues": ["e.g. 32% of domains fell to general — expand NLP seed list for X"],
-    "pipeline_improvements": ["specific code or logic changes"],
-    "alert_threshold_advice": "Should TELEGRAM_MIN_SCORE stay at 85 or move?"
-  }},
-
+  "insights": "2-3 sentence summary of what the data shows",
   "recommended_weights": {{
-    "found_score": 0.25,
-    "brand_score": 0.25,
-    "sentiment_score": 0.30,
-    "tld_value": 0.20,
-    "bonus_age": 4,
-    "bonus_backlinks": 3,
-    "bonus_niche": 5,
-    "bonus_short": 3
+    "found_score": <float 0.0-0.4>,
+    "brand_score": <float 0.0-0.4>,
+    "sentiment_score": <float 0.0-0.4>,
+    "tld_value": <float 0.0-0.3>,
+    "bonus_age": <int 0-8>,
+    "bonus_backlinks": <int 0-8>,
+    "bonus_niche": <int 0-10>,
+    "bonus_short": <int 0-6>
   }},
-
-  "min_score_suggestion": 85,
-
-  "action_items": ["concrete next steps prioritised by impact"]
+  "niche_focus": ["list", "of", "niches", "to", "prioritise"],
+  "niche_avoid": ["list", "of", "niches", "to", "reduce"],
+  "min_score_suggestion": <int 75-95>,
+  "sale_price_analysis": "2-3 sentences on which niches have the best price distribution and why",
+  "trend_projection_analysis": "2-3 sentences on which trend-keyword domain patterns look most promising and why (reference the examples)",
+  "system_improvements": [
+    "Concrete code-level or configuration suggestion 1",
+    "Concrete code-level or configuration suggestion 2",
+    "Concrete code-level or configuration suggestion 3 — must address a real failure mode you identify in the data"
+  ],
+  "action_items": ["actionable", "improvements", "for", "next", "month"]
 }}
 
-Important: forward_projections.specific_domain_ideas must include at least 5 real, registerable domain ideas
-based on the keyword signals in the scan data. Think about compound keywords like
-jioai, starlinkindia, upichain, bharatllm — combinations of trending brand/geo signals
-with high-value niche suffixes. Base confidence on how many times related keywords appeared.
+Rules:
+• Weights must sum to approximately 1.0 for the four main weights (found_score + brand_score + sentiment_score + tld_value).
+• system_improvements must be actionable engineering suggestions, not generic advice.
+• trend_projection_analysis must reference at least one specific domain example from the projections list.
 """
         try:
             r = requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 2500,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500,
+                      "messages": [{"role": "user", "content": prompt}]},
                 timeout=45,
             )
             if r.status_code == 200:
@@ -667,13 +630,12 @@ with high-value niche suffixes. Base confidence on how many times related keywor
                 content = re.sub(r"^```json|^```|```$", "", content, flags=re.M).strip()
                 return json.loads(content)
             else:
-                log.error(f"Claude API error {r.status_code}: {r.text[:300]}")
+                log.error(f"Claude API error {r.status_code}: {r.text[:200]}")
         except Exception as e:
             log.error(f"AI learning call failed: {e}")
         return None
 
     def apply_learned_weights(self) -> bool:
-        """Run monthly cycle. Returns True if weights were updated."""
         last = self.conn.execute(
             "SELECT generated_at FROM learning_snapshots ORDER BY generated_at DESC LIMIT 1"
         ).fetchone()
@@ -683,25 +645,25 @@ with high-value niche suffixes. Base confidence on how many times related keywor
                 log.info(f"AI Learning: last snapshot {last[0][:10]} — skipping (< 25 days)")
                 return False
 
-        outcomes  = self._fetch_outcome_data()
-        scans     = self._fetch_daily_scan_data()
-
-        if len(scans) < 10:
-            log.info(f"AI Learning: only {len(scans)} scans — need ≥10. Skipping.")
+        data = self._fetch_30day_data()
+        if len(data) < 5:
+            log.info(f"AI Learning: only {len(data)} outcomes — need ≥5. Skipping.")
             return False
 
-        sale_stats = self._build_sale_price_stats(outcomes)
-        scan_stats = self._build_scan_stats(scans)
+        scans            = self._fetch_30day_scans()
+        trend_keywords   = self._fetch_recent_trend_keywords()
+        stats            = self._build_stats(data)
+        sale_dist        = self._build_sale_price_distribution(scans)
+        trend_proj       = self._build_trend_projections(trend_keywords)
 
-        log.info(f"AI Learning: analysing {len(scans)} scans, "
-                 f"{sale_stats['total_sold']} sold, "
-                 f"{sale_stats['total_registered']} registered...")
+        log.info(f"AI Learning: analysing {stats['total_alerted']} domains + "
+                 f"{len(scans)} daily scans + {len(trend_proj)} trend projections...")
 
-        result = self._call_claude(outcomes, sale_stats, scan_stats)
+        result = self._call_claude(stats, sale_dist, trend_proj)
         if not result:
             return False
 
-        # Apply weight updates
+        # Apply weights if valid
         rw = result.get("recommended_weights", {})
         main_sum = sum(rw.get(k, SCORING_WEIGHTS[k])
                        for k in ["found_score","brand_score","sentiment_score","tld_value"])
@@ -713,124 +675,68 @@ with high-value niche suffixes. Base confidence on how many times related keywor
         else:
             log.warning(f"AI Learning: weight sum {main_sum:.2f} out of range — ignoring")
 
-        # Persist snapshot
+        # Surface system improvements prominently
+        improvements = result.get("system_improvements", [])
+        if improvements:
+            log.info("🔧 AI System Improvements recommended:")
+            for i, tip in enumerate(improvements, 1):
+                log.info(f"   {i}. {tip}")
+
+        # Surface trend analysis
+        if result.get("trend_projection_analysis"):
+            log.info(f"📡 Trend Projection Analysis: {result['trend_projection_analysis']}")
+
         snap_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         db_write(self.conn, """
-            INSERT OR REPLACE INTO learning_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO learning_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             snap_id, datetime.utcnow().isoformat(),
-            scan_stats["total_scans"],
-            0.0,  # avg_score placeholder
-            scan_stats["alert_rate_pct"] / 100,
-            sale_stats["total_sold"] / max(1, sale_stats["total_registered"]),
-            sale_stats["avg_sale_price_usd"],
-            ",".join(result.get("forward_projections", {}).get("projected_niches", [])),
-            ",".join(result.get("system_recommendations", {}).get("data_quality_issues", [])),
-            result.get("insights", ""),
-            json.dumps(result.get("sale_price_analysis", {})),
-            json.dumps(result.get("forward_projections", {})),
-            json.dumps(result.get("system_recommendations", {})),
-            json.dumps(rw),
+            stats["total_alerted"], stats["avg_score"],
+            stats["conversion_rate"], stats["flip_rate"], stats["avg_sale_usd"],
+            ",".join(stats["best_niches"]), ",".join(stats.get("worst_niches", [])),
+            result.get("insights", ""), json.dumps(rw),
+            json.dumps(improvements),
         ))
-
-        log.info(f"💡 Insights: {result.get('insights', '')}")
-        self._send_monthly_digest(result, sale_stats, scan_stats)
+        log.info(f"💡 AI Insights: {result.get('insights', '')}")
         return True
 
-    def _send_monthly_digest(self, result: Dict, sale_stats: Dict, scan_stats: Dict):
-        """Send the full monthly analysis as a Telegram message."""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-
-        fp   = result.get("forward_projections", {})
-        sr   = result.get("system_recommendations", {})
-        spa  = result.get("sale_price_analysis", {})
-        ideas = fp.get("specific_domain_ideas", [])[:5]
-
-        ideas_text = ""
-        for i, idea in enumerate(ideas, 1):
-            ideas_text += (
-                f"  {i}. `{idea.get('domain','?')}` — "
-                f"${idea.get('estimated_value_usd',0):,} est. "
-                f"[{idea.get('confidence','?')} confidence]\n"
-                f"     _{idea.get('rationale','')}_\n"
-            )
-
-        actions = "\n".join(f"  • {a}" for a in result.get("action_items", [])[:5])
-        fixes   = "\n".join(f"  • {f}" for f in sr.get("scoring_fixes", [])[:3])
-
-        msg = (
-            f"📊 *MONTHLY AI ANALYSIS REPORT*\n"
-            f"_{datetime.utcnow().strftime('%B %Y')}_\n"
-            f"\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"*Executive Summary*\n"
-            f"_{result.get('insights', 'No insights generated.')}_\n"
-            f"\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 *PILLAR A — SALE PRICE ANALYSIS*\n"
-            f"Domains sold: *{sale_stats['total_sold']}*  │  "
-            f"Avg price: *${sale_stats['avg_sale_price_usd']:,.0f}*  │  "
-            f"Avg days: *{sale_stats['avg_days_to_sell']:.0f}d*\n"
-            f"_{spa.get('pricing_strategy', '')}_\n"
-            f"\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔭 *PILLAR B — FORWARD PROJECTIONS (next 30-90 days)*\n"
-            f"_{fp.get('summary', '')}_\n"
-            f"\n"
-            f"*Register these now:*\n"
-            f"{ideas_text}"
-            f"\n"
-            f"🇮🇳 India signal: _{fp.get('india_specific', 'N/A')}_\n"
-            f"\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔧 *PILLAR C — SYSTEM RECOMMENDATIONS*\n"
-            f"Scans this month: *{scan_stats['total_scans']}*  │  "
-            f"Alert rate: *{scan_stats['alert_rate_pct']}%*  │  "
-            f"General-niche miss: *{scan_stats['general_niche_pct']}%*\n"
-            f"\n"
-            f"*Scoring fixes:*\n{fixes}\n"
-            f"\n"
-            f"*Alert threshold advice:* _{sr.get('alert_threshold_advice', '')}_\n"
-            f"\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ *Top Action Items:*\n{actions}"
-        )
-
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                      "parse_mode": "Markdown", "disable_web_page_preview": True},
-                timeout=10,
-            )
-            log.info("📬 Monthly digest sent to Telegram")
-        except Exception as e:
-            log.error(f"Monthly digest Telegram error: {e}")
-
     def print_tracker_report(self):
-        scans = self._fetch_daily_scan_data()
-        outcomes = self._fetch_outcome_data()
-        if not scans:
-            log.info("Tracker: no scans in last 30 days yet.")
+        data = self._fetch_30day_data()
+        if not data:
+            log.info("Tracker: no data in last 30 days yet.")
             return
-        ss = self._build_scan_stats(scans)
-        sp = self._build_sale_price_stats(outcomes)
-        print("\n" + "═"*60)
-        print("  30-DAY DOMAIN SNIPER TRACKER REPORT (v5)")
-        print("═"*60)
-        print(f"  Total scans     : {ss['total_scans']} domains evaluated")
-        print(f"  Alerts sent     : {ss['total_alerted']} (score > {TELEGRAM_MIN_SCORE})")
-        print(f"  Alert rate      : {ss['alert_rate_pct']}%")
-        print(f"  General-niche   : {ss['general_niche_pct']}% (NLP miss rate)")
-        print(f"  Domains sold    : {sp['total_sold']}")
-        print(f"  Avg sale price  : ${sp['avg_sale_price_usd']:,.2f}")
-        print(f"  Avg days to sell: {sp['avg_days_to_sell']:.0f}")
-        print(f"  Top niches      : {list(ss['niche_distribution'].keys())[:5]}")
-        print(f"  Active weights  : {SCORING_WEIGHTS}")
-        print("═"*60 + "\n")
+        stats = self._build_stats(data)
 
-# ─────────────────────────── NETWORK HELPERS ───────────────────
+        # FIX 6 — also show daily_scans rejection breakdown
+        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        total_scanned = self.conn.execute(
+            "SELECT COUNT(1) FROM daily_scans WHERE scanned_at >= ?", (cutoff,)
+        ).fetchone()[0]
+        rejections = self.conn.execute("""
+            SELECT rejection_reason, COUNT(1) as cnt
+            FROM daily_scans WHERE scanned_at >= ? AND rejection_reason != ''
+            GROUP BY rejection_reason ORDER BY cnt DESC LIMIT 5
+        """, (cutoff,)).fetchall()
+
+        print("\n" + "═"*62)
+        print("  30-DAY DOMAIN SNIPER v5 TRACKER REPORT")
+        print("═"*62)
+        print(f"  Total scanned (all)     : {total_scanned}")
+        print(f"  Domains alerted (≥{MIN_ALERT_SCORE})   : {stats['total_alerted']}")
+        print(f"  Telegammed (>{TELEGRAM_SCORE_GATE})        : see domain_outcomes")
+        print(f"  Registered              : {stats['registered']}  ({stats['conversion_rate']:.0%})")
+        print(f"  Sold/Flipped            : {stats['sold']}  ({stats['flip_rate']:.0%})")
+        print(f"  Avg sale price          : ${stats['avg_sale_usd']:,.2f}")
+        print(f"  Avg alert score         : {stats['avg_score']}")
+        print(f"  Best niches             : {stats['best_niches']}")
+        if rejections:
+            print(f"\n  Top rejection reasons (daily_scans):")
+            for reason, cnt in rejections:
+                print(f"    • {reason}: {cnt}")
+        print(f"\n  Active weights          : {SCORING_WEIGHTS}")
+        print("═"*62 + "\n")
+
+# ─────────────────────────── NETWORK ───────────────────────────
 def http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -1091,11 +997,12 @@ def compute_final_score(found: float, brand: float, sentiment: float,
       + (tld_val  * W["tld_value"])
     )
     bonus = 0
-    if age >= 5:                           bonus += W["bonus_age"]
-    if bl  >= 10:                          bonus += W["bonus_backlinks"]
-    if niche != "general":                 bonus += W["bonus_niche"]
-    if len(sld) <= 6 and "-" not in sld:   bonus += W["bonus_short"]
-    return min(base + bonus, 100), base, bonus
+    if age >= 5:                         bonus += W["bonus_age"]
+    if bl  >= 10:                        bonus += W["bonus_backlinks"]
+    if niche != "general":               bonus += W["bonus_niche"]
+    if len(sld) <= 6 and "-" not in sld: bonus += W["bonus_short"]
+    final = min(base + bonus, 100)
+    return final, base, bonus
 
 # ─────────────────────────── PROBABILITY ───────────────────────
 class ProbabilityEngine:
@@ -1109,12 +1016,12 @@ class ProbabilityEngine:
     def p_flip_success(self, score: int, niche: str, age: int, bl: int,
                        cpc: float = 0.50, search_vol: float = 50.0) -> float:
         intent_signal  = math.log1p(cpc) * 0.18 + math.log1p(search_vol) * 0.04
-        quality_signal = (0.06 * score - 3.5
-                          + 0.003 * min(bl, 250)
+        quality_signal = (0.06 * score - 3.5 + 0.003 * min(bl, 250)
                           + 0.015 * math.log1p(min(age, 20)))
         raw_p      = self.sigmoid(intent_signal + quality_signal)
         niche_ceil = NICHE_MAX_PFLIP.get(niche, 0.03)
-        return round(max(0.005, min(raw_p, niche_ceil, self.GLOBAL_MAX_P_FLIP)), 4)
+        p_capped   = min(raw_p, niche_ceil, self.GLOBAL_MAX_P_FLIP)
+        return round(max(0.005, p_capped), 4)
 
     def monte_carlo(self, base: float, niche: str, age: int, cpc: float) -> Dict:
         age_contribution = age * (cpc * 10.0)
@@ -1134,17 +1041,22 @@ class ProbabilityEngine:
     def kelly(self, p_win: float, p50: float, reg_cost: float) -> Dict:
         b = (p50 - reg_cost) / reg_cost
         if b <= 0:
-            return {"allocation_usd": 0.0, "f_star": 0.0, "verdict": "Pass",
-                    "safety_margin_pct": 0.0,
-                    "quarter_kelly_note": "MC p50 below reg cost — no position"}
-        f_full    = (b * p_win - (1 - p_win)) / b
-        f_quarter = max(0.0, min(0.25, f_full * KELLY_FRACTION))
-        alloc_usd = round(f_quarter * KELLY_BANKROLL, 2)
-        safety    = round((reg_cost / KELLY_BANKROLL) * 100, 3)
-        verdict   = "Strong Buy" if f_quarter > 0.08 else "Buy" if f_quarter > 0.02 else "Pass"
-        return {"allocation_usd": alloc_usd, "f_star": f_quarter, "verdict": verdict,
-                "safety_margin_pct": safety,
-                "quarter_kelly_note": "Quarter-Kelly applied (÷4 for domain illiquidity)"}
+            return {
+                "allocation_usd": 0.0, "f_star": 0.0, "verdict": "Pass",
+                "safety_margin_pct": 0.0, "quarter_kelly_note": "MC p50 below reg cost",
+            }
+        f_full     = (b * p_win - (1 - p_win)) / b
+        f_quarter  = max(0.0, min(0.25, f_full * KELLY_FRACTION))
+        alloc_usd  = round(f_quarter * KELLY_BANKROLL, 2)
+        safety_margin_pct = round((reg_cost / KELLY_BANKROLL) * 100, 3)
+        verdict = "Strong Buy" if f_quarter > 0.08 else "Buy" if f_quarter > 0.02 else "Pass"
+        return {
+            "allocation_usd":     alloc_usd,
+            "f_star":             f_quarter,
+            "verdict":            verdict,
+            "safety_margin_pct":  safety_margin_pct,
+            "quarter_kelly_note": "Quarter-Kelly applied (÷4 for illiquidity)",
+        }
 
 def fetch_namebio_median(conn, keyword: str) -> float:
     row = conn.execute(
@@ -1156,29 +1068,36 @@ def fetch_namebio_median(conn, keyword: str) -> float:
 def worthiness_verdict(score: int, kelly_verdict: str, p_win: float,
                        mc_p50: float, reg_cost: float,
                        safety_margin_pct: float) -> Tuple[str, str]:
-    roi = mc_p50 / reg_cost if reg_cost > 0 else 0
-    m   = f"Registration is {safety_margin_pct:.2f}% of your bankroll."
-    if score >= 90 and p_win >= 0.15 and roi >= 20:
-        return ("🔥 STRONG BUY",
-                f"Top domain. ${reg_cost:.0f} reg → ~${mc_p50:,.0f} median ({roi:.0f}x ROI). {m}")
-    elif score >= 85 and p_win >= 0.10 and roi >= 10:
-        return ("✅ GOOD BUY",
-                f"Solid pick. ~{roi:.0f}x ROI at median estimate. List on Sedo/Afternic. {m}")
-    elif score >= 80 and roi >= 5:
-        return ("⚠️ MARGINAL",
-                f"Acceptable risk. ~{roi:.0f}x ROI, flip prob {p_win:.1%}. {m}")
+    roi_multiple = mc_p50 / reg_cost if reg_cost > 0 else 0
+    margin_str   = f"Registration is just {safety_margin_pct:.2f}% of your bankroll."
+    if score >= 90 and p_win >= 0.15 and roi_multiple >= 20:
+        label  = "🔥 STRONG BUY"
+        reason = (f"Top-tier domain. Costs ${reg_cost:.0f} to register — median resale "
+                  f"~${mc_p50:,.0f} ({roi_multiple:.0f}x ROI). {margin_str}")
+    elif score >= 85 and p_win >= 0.10 and roi_multiple >= 10:
+        label  = "✅ GOOD BUY"
+        reason = (f"Solid pick. ~{roi_multiple:.0f}x ROI at median estimate. "
+                  f"Register and list on Sedo/Afternic immediately. {margin_str}")
+    elif score >= 80 and roi_multiple >= 5:
+        label  = "⚠️ MARGINAL"
+        reason = (f"Acceptable risk. ~{roi_multiple:.0f}x ROI potential but moderate "
+                  f"flip probability ({p_win:.1%}). {margin_str}")
     else:
-        return ("❌ SKIP", "Risk/reward not favourable.")
+        label  = "❌ SKIP"
+        reason = "Risk/reward not favourable. Move to the next domain."
+    return label, reason
 
 # ─────────────────────────── TELEGRAM ──────────────────────────
-def send_telegram_alert(d: Dict):
-    """CHANGE 1 — only called when final_score > TELEGRAM_MIN_SCORE (85)."""
+def send_telegram(d: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    se  = "🟢" if d["sentiment_compound"] > 0.1 else "🔴" if d["sentiment_compound"] < -0.1 else "⚪"
-    inr = lambda x: f"₹{x * USD_TO_INR:,.0f}"
-    nd  = d["niche"].replace("_", " ").title()
-
+    se     = "🟢" if d["sentiment_compound"] > 0.1 else "🔴" if d["sentiment_compound"] < -0.1 else "⚪"
+    inr    = lambda x: f"₹{x * USD_TO_INR:,.0f}"
+    niche_display = d["niche"].replace("_", " ").title()
+    safety_line = (
+        f"Wide safety margin — registration is only "
+        f"{d['safety_margin_pct']:.2f}% of your bankroll."
+    )
     msg = (
         f"🏆 *DOMAIN ALERT* — Score: {d['final_score']}/100\n"
         f"🌐 *{d['domain']}*\n"
@@ -1189,22 +1108,31 @@ def send_telegram_alert(d: Dict):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"\n"
         f"📌 *The Metrics:*\n"
-        f"💳 Reg Cost: *${d['reg_cost_usd']:.2f}* ({inr(d['reg_cost_usd'])})\n"
-        f"   _{d['safety_margin_pct']:.2f}% of bankroll — wide safety margin_\n"
         f"\n"
-        f"📈 Est. Resale (2,000 scenarios):\n"
-        f"   Low  ${d['mc_p10']:,.0f} │ Mid ${d['mc_p50']:,.0f} │ High ${d['mc_p90']:,.0f}\n"
+        f"💳 *Reg Cost* — what you pay RIGHT NOW:\n"
+        f"   ${d['reg_cost_usd']:.2f} ({inr(d['reg_cost_usd'])})\n"
+        f"   _{safety_line}_\n"
         f"\n"
-        f"💰 Max Spend (Quarter-Kelly): *${d['kelly_alloc_usd']:,.2f}* — {d['kelly_verdict']}\n"
+        f"📈 *Est. Resale Value* (2,000-scenario Monte Carlo):\n"
+        f"   Low: ${d['mc_p10']:,.0f} ({inr(d['mc_p10'])})\n"
+        f"   Mid: ${d['mc_p50']:,.0f} ({inr(d['mc_p50'])})\n"
+        f"   High: ${d['mc_p90']:,.0f} ({inr(d['mc_p90'])})\n"
+        f"\n"
+        f"💰 *Max Suggested Spend* (Quarter-Kelly, illiquidity-adjusted):\n"
+        f"   ${d['kelly_alloc_usd']:,.2f} ({inr(d['kelly_alloc_usd'])}) — {d['kelly_verdict']}\n"
         f"   _{d['kelly_quarter_note']}_\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Intent (NLP): *{nd}*  │  CPC: ${d['cpc']:.2f}\n"
-        f"{se} Sentiment: {d['sentiment_score']:.0f}/100  │  Age: {d['age_years']}y\n"
-        f"📊 Flip prob: {d['p_flip_success']:.1%} _(capped at 20% STR)_\n"
+        f"🎯 *Intent* (Dynamic NLP): *{niche_display}*\n"
+        f"{se} *Sentiment*: {d['sentiment_score']:.0f}/100"
+        f"   ({d['headline_count']} headlines)\n"
+        f"📊 *Flip Probability*: {d['p_flip_success']:.1%} "
+        f"_(realistic STR, capped at 20%)_\n"
+        f"🕰️ *Age*: {d['age_years']} years  │  *CPC*: ${d['cpc']:.2f}\n"
         f"\n"
         f"🔗 [GoDaddy]({d['link_godaddy']}) │ "
         f"[Namecheap]({d['link_namecheap']}) │ "
+        f"[Name.com]({d['link_name']}) │ "
         f"[Sedo]({d['link_sedo']})"
     )
     try:
@@ -1218,7 +1146,7 @@ def send_telegram_alert(d: Dict):
         log.error(f"Telegram error: {e}")
 
 # ─────────────────────────── GOOGLE SHEETS ─────────────────────
-def push_to_sheets(df: pd.DataFrame, tab: str = SHEET_NAME):
+def push_to_sheets(df: pd.DataFrame):
     if not GSPREAD_OK or not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         return
     try:
@@ -1228,46 +1156,74 @@ def push_to_sheets(df: pd.DataFrame, tab: str = SHEET_NAME):
                     "https://www.googleapis.com/auth/drive"])
         sh = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
         try:
-            ws = sh.worksheet(tab)
+            ws = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(tab, 5000, 30)
+            ws = sh.add_worksheet(SHEET_NAME, 2000, 30)
         vals = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
         ws.clear()
         ws.update(vals, value_input_option="RAW")
-        log.info(f"Sheets [{tab}]: {len(df)} rows pushed")
+        log.info(f"Sheets: {len(df)} rows pushed")
     except Exception as e:
         log.error(f"Sheets error: {e}")
 
 # ─────────────────────────── PROCESS DOMAIN ────────────────────
-def process_domain(domain: str, source: str, conn, run_id: str,
+def process_domain(domain: str, source: str, run_id: str, conn,
                    seo: SEOIntelligence,
                    sent: InstitutionalSentimentEngine,
                    tm: TrademarkGuard) -> Optional[Dict]:
     """
-    CHANGE 1 — Returns a result dict for ALL domains that pass pre-filters.
-    Scoring happens unconditionally. The caller decides what to do based on score.
-    base_score and bonus are included in the dict for daily_scans logging.
+    Returns a full result dict on success (score >= MIN_ALERT_SCORE).
+    Returns None on failure but ALWAYS writes to daily_scans (FIX 6)
+    and ALWAYS calls mark_seen (FIX 5) before returning.
     """
     log.info(f"⏳ Processing: {domain}")
     sld = domain.split(".")[0].lower()
     tld = "." + domain.split(".")[-1].lower()
 
+    # Partial scan_data built up progressively so we can log even on early exit
+    scan_data: Dict = {
+        "tld": tld, "source": source,
+        "niche": "unknown", "age_years": 0,
+        "brand_score": 0.0, "sentiment_score": 50.0, "sentiment_compound": 0.0,
+        "headline_count": 0, "backlinks": 0, "snapshots": 0, "cc_hits": 0,
+        "found_score": 0.0, "base_score": 0, "bonus": 0, "final_score": 0,
+        "cpc": 0.0, "p_flip_success": 0.0, "mc_p10": 0.0, "mc_p50": 0.0, "mc_p90": 0.0,
+        "reg_cost_usd": TLD_REG_COSTS.get(tld, DEFAULT_REG_COST),
+        "kelly_verdict": "", "kelly_alloc_usd": 0.0,
+        "worthiness_label": "", "trademark_risk": "UNCHECKED",
+    }
+
+    # ── cheap pre-filters ──
     if sld.count("-") > 1 or "--" in sld:
+        log.debug(f"  Skipped: too many hyphens")
+        log_daily_scan(conn, run_id, domain, source, scan_data, "too_many_hyphens")
+        mark_seen(conn, domain, 0, "rejected")           # FIX 5
         return None
     if len(sld) > 12:
+        log.debug(f"  Skipped: SLD too long ({len(sld)})")
+        log_daily_scan(conn, run_id, domain, source, scan_data, "sld_too_long")
+        mark_seen(conn, domain, 0, "rejected")
         return None
     if re.fullmatch(r"[a-z]+", sld) and not re.search(r"[aeiou]", sld):
+        log.debug(f"  Skipped: no vowels")
+        log_daily_scan(conn, run_id, domain, source, scan_data, "no_vowels")
+        mark_seen(conn, domain, 0, "rejected")
         return None
 
     is_available, age = port43_whois_audit(domain)
+    scan_data["age_years"] = age
     log.info(f"  WHOIS: available={is_available} age={age}y")
 
     niche = _NICHE_CLASSIFIER.classify(domain)
+    scan_data["niche"] = niche
     log.info(f"  NLP Niche: {niche}")
 
     tm_data = tm.check(domain)
+    scan_data["trademark_risk"] = tm_data["risk"]
     if tm_data["risk"] == "RISK":
         log.warning(f"  ❌ Trademark RISK — skip")
+        log_daily_scan(conn, run_id, domain, source, scan_data, "trademark_risk")
+        mark_seen(conn, domain, 0, "rejected")           # FIX 5
         return None
 
     try:    bl    = fetch_wayback_backlinks(domain)
@@ -1276,6 +1232,7 @@ def process_domain(domain: str, source: str, conn, run_id: str,
     except: snaps = 10
     try:    cc    = fetch_commoncrawl_presence(domain)
     except: cc    = 1
+    scan_data.update({"backlinks": bl, "snapshots": snaps, "cc_hits": cc})
     log.info(f"  Footprint: bl={bl} snaps={snaps} cc={cc}")
 
     sent_data  = sent.analyze_asset_sentiment(sld)
@@ -1284,9 +1241,16 @@ def process_domain(domain: str, source: str, conn, run_id: str,
 
     cpc        = seo_data["cpc"]
     search_vol = seo_data["search_vol_proxy"]
+    scan_data.update({
+        "sentiment_score":    sent_data["sentiment_score"],
+        "sentiment_compound": sent_data["compound"],
+        "headline_count":     sent_data.get("headline_count", 0),
+        "cpc":                cpc,
+    })
 
     found_score = min(100.0, (bl/3.0)*32 + (cc*20)*26 + (age*5)*24)
     brand_score = compute_brand_score(sld)
+    scan_data.update({"found_score": found_score, "brand_score": brand_score})
 
     final_score, base_score, bonus = compute_final_score(
         found_score, brand_score,
@@ -1294,64 +1258,67 @@ def process_domain(domain: str, source: str, conn, run_id: str,
         TLD_VALUE.get(tld, DEFAULT_TLD),
         age, bl, niche, sld,
     )
+    scan_data.update({"final_score": final_score, "base_score": base_score, "bonus": bonus})
     log.info(f"  Score: {final_score} (base={base_score}+bonus={bonus})")
 
-    # ── Probability + MC + Kelly (computed for all, needed for daily_scans) ──
-    prob    = ProbabilityEngine()
-    p_win   = prob.p_flip_success(final_score, niche, age, bl, cpc, search_vol)
+    if final_score < MIN_ALERT_SCORE:
+        log.debug(f"  ⬇ {final_score} < {MIN_ALERT_SCORE} — skip")
+        # FIX 6: log to daily_scans even on rejection
+        log_daily_scan(conn, run_id, domain, source, scan_data, f"score_below_{MIN_ALERT_SCORE}")
+        # FIX 5: mark seen so we never re-evaluate this domain
+        mark_seen(conn, domain, final_score, "rejected")
+        return None
+
+    prob  = ProbabilityEngine()
+    p_win = prob.p_flip_success(final_score, niche, age, bl, cpc, search_vol)
+
     mc_base = max(comp_median, snaps * 12.0)
     mc      = prob.monte_carlo(mc_base, niche, age, cpc)
+    scan_data.update({"mc_p10": mc["p10"], "mc_p50": mc["p50"], "mc_p90": mc["p90"],
+                      "p_flip_success": p_win})
 
     reg_cost_usd = TLD_REG_COSTS.get(tld, DEFAULT_REG_COST)
     k = prob.kelly(p_win, mc["p50"], reg_cost_usd)
+    scan_data.update({"kelly_verdict": k["verdict"], "kelly_alloc_usd": k["allocation_usd"]})
 
     worth_label, worth_reason = worthiness_verdict(
         final_score, k["verdict"], p_win, mc["p50"],
         reg_cost_usd, k["safety_margin_pct"],
     )
+    scan_data["worthiness_label"] = worth_label
 
-    gd_aff = f"&isc={AFFILIATE_ID_GD}"          if AFFILIATE_ID_GD else ""
-    nc_aff = f"&AffiliateCode={AFFILIATE_ID_NC}" if AFFILIATE_ID_NC else ""
+    # FIX 6: log successful domains to daily_scans too (no rejection_reason)
+    log_daily_scan(conn, run_id, domain, source, scan_data, "")
+
+    gd_aff = f"&isc={AFFILIATE_ID_GD}"           if AFFILIATE_ID_GD else ""
+    nc_aff = f"&AffiliateCode={AFFILIATE_ID_NC}"  if AFFILIATE_ID_NC else ""
 
     return {
-        # identity
         "domain":             domain,
         "tld":                tld,
         "source":             source,
-        # scoring (needed for daily_scans)
         "final_score":        final_score,
-        "_base_score":        base_score,
-        "_bonus":             bonus,
-        # niche + age
         "niche":              niche,
         "age_years":          age,
         "cpc":                cpc,
-        # sentiment
         "sentiment_compound": sent_data["compound"],
         "sentiment_score":    sent_data["sentiment_score"],
         "headline_count":     sent_data.get("headline_count", 0),
-        # probability
         "p_flip_success":     p_win,
-        # monte carlo
         "mc_p10":             mc["p10"],
         "mc_p50":             mc["p50"],
         "mc_p90":             mc["p90"],
-        # kelly
         "kelly_verdict":      k["verdict"],
         "kelly_alloc_usd":    k["allocation_usd"],
         "kelly_alloc_inr":    k["allocation_usd"] * USD_TO_INR,
         "safety_margin_pct":  k["safety_margin_pct"],
         "kelly_quarter_note": k["quarter_kelly_note"],
-        # cost
         "reg_cost_usd":       reg_cost_usd,
         "reg_cost_inr":       reg_cost_usd * USD_TO_INR,
-        # verdict
         "worthiness_label":   worth_label,
         "worthiness_reason":  worth_reason,
-        # raw signals
         "brand_score":        brand_score,
         "backlinks":          bl,
-        # links
         "link_godaddy":    f"https://www.godaddy.com/domainsearch/find?domainToCheck={domain}{gd_aff}",
         "link_namecheap":  f"https://www.namecheap.com/domains/registration/results/?domain={domain}{nc_aff}",
         "link_name":       f"https://www.name.com/domain/search/{domain}",
@@ -1377,17 +1344,18 @@ class QuantumCombinatoricsEngine:
 # ─────────────────────────── MAIN ──────────────────────────────
 def main():
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    log.info(f"═══ Domain Sniper v5 │ Run: {run_id} ═══")
-    log.info(f"    Save all scans ≥ score {SAVE_ALL_SCORE}")
-    log.info(f"    Telegram alert  > score {TELEGRAM_MIN_SCORE}")
-    log.info(f"    Quarter-Kelly: {KELLY_FRACTION}  │  Bankroll: ${KELLY_BANKROLL:,.0f}")
-    log.info(f"    NLP: {'spacy' if SPACY_OK else 'keyword-index'}")
+    log.info(f"═══ Domain Sniper v5 │ Run: {run_id} │ Min score: {MIN_ALERT_SCORE} ═══")
+    log.info(f"    Telegram gate: >{TELEGRAM_SCORE_GATE} │ Quarter-Kelly: {KELLY_FRACTION} │ Bankroll: ${KELLY_BANKROLL:,.0f}")
+    log.info(f"    NLP classifier: {'spacy' if SPACY_OK else 'keyword-index'}")
+    log.info(f"    FIX 5: ALL evaluated domains marked seen (incl. rejects)")
+    log.info(f"    FIX 6: daily_scans audit trail active")
+    log.info(f"    FIX 7: Telegram fires only at score > {TELEGRAM_SCORE_GATE}")
+    log.info(f"    FIX 8: AI learning includes sale distribution + trend projections")
 
     fetch_latest_commoncrawl_index()
     conn = init_db()
     seed_namebio_cache(conn)
 
-    # Monthly AI analysis (runs once per 25 days)
     ai_engine = AILearningEngine(conn)
     ai_engine.apply_learned_weights()
     ai_engine.print_tracker_report()
@@ -1404,61 +1372,61 @@ def main():
     quantum = QuantumCombinatoricsEngine()
     pool    = quantum.generate(kws, top_n=30)
 
-    all_scanned, alerted, seen = [], [], set()
+    results, seen_this_run = [], set()
 
     for d, src in pool:
         d_clean = d.strip().lower()
-        if d_clean in seen or is_seen(conn, d_clean):
+        if d_clean in seen_this_run:
             continue
-        seen.add(d_clean)
+        seen_this_run.add(d_clean)
 
-        res = process_domain(d_clean, src, conn, run_id,
+        # FIX 5: is_seen() now catches both successes AND previously-rejected domains.
+        # No domain is re-evaluated once it has been processed, ever.
+        if is_seen(conn, d_clean):
+            log.debug(f"  Already seen (success or rejected): {d_clean} — skipping")
+            continue
+
+        # process_domain always calls mark_seen + log_daily_scan internally (FIX 5 + 6)
+        res = process_domain(d_clean, src, run_id, conn,
                              seo_engine, sent_engine, tm_guard)
         if not res:
+            # Already marked seen inside process_domain
             continue
 
-        score         = res["final_score"]
-        should_alert  = score > TELEGRAM_MIN_SCORE   # CHANGE 1: strict >
+        # FIX 7 — track outcomes for all scores >= MIN_ALERT_SCORE,
+        # but only Telegram at scores > TELEGRAM_SCORE_GATE
+        track_domain_alert(conn, res, res["mc_p10"], res["mc_p50"], res["mc_p90"],
+                           res["brand_score"], res["backlinks"])
 
-        # ── CHANGE 1: save every scan to daily_scans regardless of score ──
-        log_daily_scan(conn, run_id, res,
-                       base_score=res["_base_score"],
-                       bonus=res["_bonus"],
-                       alerted=should_alert)
-        all_scanned.append(res)
+        # mark_seen for successes with actual score + "flip" path
+        mark_seen(conn, d_clean, res["final_score"], "flip")
 
-        if should_alert:
-            log.info(
-                f"🔥 ALERT │ {d_clean:30s} │ {score}/100 │ "
-                f"{res['worthiness_label']} │ niche={res['niche']}"
-            )
-            track_domain_alert(conn, res, res["mc_p10"], res["mc_p50"], res["mc_p90"],
-                               res["brand_score"], res["backlinks"])
-            mark_seen(conn, d_clean, score, "flip")
-            send_telegram_alert(res)
-            alerted.append(res)
-        else:
-            log.debug(f"  📁 Saved to daily_scans (score={score}, no alert)")
+        telegram_fired = False
+        if res["final_score"] > TELEGRAM_SCORE_GATE:
+            send_telegram(res)
+            telegram_fired = True
 
-    # ── Export daily CSV (all scans) ─────────────────────────────
-    if all_scanned:
-        df_all = pd.DataFrame(all_scanned).sort_values("final_score", ascending=False)
-        # Drop internal keys before export
-        df_all = df_all.drop(columns=["_base_score","_bonus"], errors="ignore")
-        df_all.to_csv(f"daily_scans_{run_id}.csv", index=False)
-        log.info(f"📁 All {len(all_scanned)} scans saved to daily_scans_{run_id}.csv")
+        log.info(
+            f"{'🔥' if telegram_fired else '📋'} "
+            f"{'ALERT' if telegram_fired else 'LOGGED'} │ "
+            f"{d_clean:30s} │ {res['final_score']}/100 │ "
+            f"{res['worthiness_label']} │ niche={res['niche']} │ "
+            f"p_flip={res['p_flip_success']:.1%} │ "
+            f"{'Telegammed ✓' if telegram_fired else f'Below Telegram gate ({TELEGRAM_SCORE_GATE})'}"
+        )
 
-    # ── Export alerted CSV + push to Sheets ──────────────────────
-    if alerted:
-        df_alert = pd.DataFrame(alerted).sort_values("final_score", ascending=False)
-        df_alert = df_alert.drop(columns=["_base_score","_bonus"], errors="ignore")
-        df_alert.to_csv(f"alerts_{run_id}.csv", index=False)
-        push_to_sheets(df_alert, tab=SHEET_NAME)
-        log.info(f"🔔 {len(alerted)} alerts pushed to Sheets tab '{SHEET_NAME}'")
+        results.append(res)
 
+    if results:
+        df = pd.DataFrame(results).sort_values("final_score", ascending=False)
+        df.to_csv(f"institutional_output_{run_id}.csv", index=False)
+        push_to_sheets(df)
+
+    telegammed = sum(1 for r in results if r["final_score"] > TELEGRAM_SCORE_GATE)
     log.info(
-        f"Run complete. Scanned: {len(all_scanned)} │ "
-        f"Alerted (score > {TELEGRAM_MIN_SCORE}): {len(alerted)}"
+        f"Run complete. Evaluated={len(seen_this_run)} │ "
+        f"Logged={len(results)} (≥{MIN_ALERT_SCORE}) │ "
+        f"Telegammed={telegammed} (>{TELEGRAM_SCORE_GATE})"
     )
     conn.close()
 
